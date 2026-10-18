@@ -54,6 +54,40 @@ on Windows it uses Win32. A headless machine can still build and run `--selftest
 
 After that, plain `bot1` is the only command you need.
 
+## What it looks like
+
+One screen, redrawn in place while it learns, instead of a wall of `[Tag] text` scrolling past:
+
+```text
+╭─ Minecraft 26.3 - Singleplayer ────────────────────────────────────────────── RUNNING ─╮
+│ steps     2,228   185.2/s   2% in game   00:12   15 episode(s)   08:47 left            │
+│ reward    +2.2152/step   ▅█▁▃▅▇█▇▆▅▃▄▆█▇▅                                         │
+│ update    loss -0.035   pi -0.000   v 0.026   ent 4.83   kl +0.0162   2.93s            │
+│ rollout   70%  180/256  ██████████████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░ │
+│ actions   no keys+turn 33%   1 key(s)+turn 33%   2 key(s)+turn 13%                     │
+│ learning  3 update(s) applied, 1 in flight                                             │
+╰─ F8 pause   F9 save   F10 quit   Ctrl+C stop ──────────────────────────────────────────╯
+```
+
+- **The header and the numbers move**: steps, decisions per second, episodes, elapsed time,
+  and - with `--steps` - how long is left. Nothing is guessed; every number is the one the
+  loop is working from.
+- **The reward has a shape.** One glyph per update, newest on the right: the absolute value
+  means little, the direction is the question.
+- **Log lines are kept, not overwritten.** A checkpoint, a health warning, a pause: the panel
+  steps down, the line is printed, the panel comes back.
+- **It adapts to the terminal.** Too narrow for a border, and it becomes one dense line; no
+  colour support, and it is ASCII; piped into a file or `tee`, and it is plain `[Tag] lines`
+  with no escapes at all, exactly as before, so scripts keep working.
+- **`--ui-preview`** draws the panel with invented numbers if you want to see it without a
+  game, and **`--demo`** runs the real loop on the synthetic corridor if you want to watch it
+  fill in.
+
+On Windows the console is switched to UTF-8 and to ANSI escape handling at startup - a
+Windows 10 console does not understand either until it is asked - and on any OS the size comes
+from the actual window, so the panel is the width of the terminal it is in. `--no-color`, or
+`BOT_UI=plain`, forces the plain output anywhere.
+
 ## Does it actually learn?
 
 Yes, and it is checked rather than claimed. `bot1 --selftest` trains the *identical* code -
@@ -66,6 +100,7 @@ compares three things:
 - whether the reward prefers walking forward to walking backward or standing still.
 
 ```bash
+bot1 --demo                        # the loop and the panel, on the corridor, in seconds
 bot1 --selftest                    # ~24k decisions, a few minutes
 bot1 --selftest --steps 6000       # a quicker look
 bot1 --selftest --frame-size 64    # faster still on a weak machine
@@ -117,6 +152,9 @@ Everyday:
 | `--window HWND` | drive a specific window (see `--list-windows`) |
 | `--steps N` | stop after N decisions |
 | `--fresh` | ignore existing checkpoints |
+| `--demo` | the real loop and panel, on the synthetic corridor, no game needed |
+| `--ui-preview` | what the dashboard looks like, with invented numbers |
+| `--no-color` | plain output even in a terminal (`BOT_UI=plain` does the same) |
 | `--dry-run` | run the whole loop, inject nothing |
 | `--checkpoint-dir DIR` | put this game's runs somewhere else |
 | `--runs-dir DIR` | where the per-game directories live (default `runs/`) |

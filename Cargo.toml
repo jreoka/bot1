@@ -1,6 +1,6 @@
 [package]
 name = "bot1"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.92"
 description = "A game-agnostic bot that learns to play from pixels - Rust port of bot1.py"
@@ -42,6 +42,12 @@ windows = { version = "0.62", features = [
 # the single-binary property survives on Linux exactly as it does on Windows.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.14", features = ["xtest", "xinput", "record", "randr"] }
+
+# Terminal size on unix is a single ioctl, and std has no API for it. `libc` is
+# the same binding crate the rest of the tree already builds against through
+# transitive dependencies; nothing is linked beyond the C runtime every unix has.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # The CoreGraphics layer. These are Rust bindings to the system frameworks, so
 # the binary still needs nothing installed: the frameworks are part of macOS.

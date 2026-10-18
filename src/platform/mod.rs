@@ -435,16 +435,17 @@ pub fn resolve_target_window(request: &TargetRequest) -> Option<WindowInfo> {
 /// Ask which window to drive, on standard input.
 pub fn pick_window_interactive(windows: &[WindowInfo]) -> Option<WindowInfo> {
     use std::io::Write;
+    let ui = crate::ui::ui();
     if windows.is_empty() {
-        println!("[Window] No usable windows found. Start the game first.");
+        ui.event_as(
+            "Window",
+            crate::ui::Tone::Warn,
+            "No usable windows found. Start the game first.",
+        );
         return None;
     }
-    println!();
-    println!("{}", "-".repeat(78));
-    println!("  WHICH WINDOW SHOULD THE BOT PLAY?");
-    println!("{}", "-".repeat(78));
-    println!("{}", format_window_table(windows));
-    println!("{}", "-".repeat(78));
+    ui.section("Which window should the bot play?");
+    ui.raw(&format_window_table(windows));
     loop {
         print!("  Number (blank = cancel): ");
         let _ = std::io::stdout().flush();
@@ -459,10 +460,24 @@ pub fn pick_window_interactive(windows: &[WindowInfo]) -> Option<WindowInfo> {
         }
         match line.parse::<usize>() {
             Ok(index) if index >= 1 && index <= windows.len() => {
-                return Some(windows[index - 1].clone());
+                let chosen = windows[index - 1].clone();
+                ui.event_as(
+                    "Window",
+                    crate::ui::Tone::Good,
+                    format!("Using {}.", describe_window(Some(&chosen))),
+                );
+                return Some(chosen);
             }
-            Ok(_) => println!("  That number is not in the list."),
-            Err(_) => println!("  Please type the number shown in brackets."),
+            Ok(_) => ui.event_as(
+                "Window",
+                crate::ui::Tone::Warn,
+                "That number is not in the list.",
+            ),
+            Err(_) => ui.event_as(
+                "Window",
+                crate::ui::Tone::Warn,
+                "Please type the number shown in brackets.",
+            ),
         }
     }
 }

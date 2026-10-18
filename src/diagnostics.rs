@@ -14,20 +14,15 @@ use crate::platform::{self, Handle, WindowInfo};
 
 /// Watch a window for a few seconds and report what the capture actually yields.
 pub fn check_capture(cfg: &Config, handle: Handle, seconds: f32) -> i32 {
-    println!();
-    println!("{}", "-".repeat(74));
-    println!("  CAPTURE CHECK");
-    println!("{}", "-".repeat(74));
+    use crate::ui::{Tone, ui};
+    let ui = ui();
+    ui.section("Capture check");
     let pid = platform::current::get_window_pid(handle);
-    println!(
-        "  Window:  {handle}  process {}",
-        if platform::current::get_process_name(pid).is_empty() {
-            "?".to_string()
-        } else {
-            platform::current::get_process_name(pid)
-        }
-    );
-    println!("  Observing for {seconds:.0}s at {}px...", cfg.frame_size);
+    let process = platform::current::get_process_name(pid);
+    ui.rows(&[
+        ("window", format!("{handle}  process {}", if process.is_empty() { "?" } else { &process })),
+        ("observing", format!("{seconds:.0}s at {}px", cfg.frame_size)),
+    ]);
 
     let mut grabber = platform::FrameGrabber::new(handle);
     let mut stack = FrameStack::new(cfg.frame_size, cfg.frame_stack);
@@ -57,53 +52,77 @@ pub fn check_capture(cfg: &Config, handle: Handle, seconds: f32) -> i32 {
         }
         previous = Some(observation.data.clone());
         frames += 1;
+        // The panel is the progress bar here: watching a still number for five
+        // seconds is exactly what makes people think it has hung.
+        ui.live_now(
+            &crate::ui::Frame::new("Capture check")
+                .badge(format!("{frames} frame(s)"), Tone::Accent)
+                .line(
+                    "grab rate",
+                    format!("{:.1} fps, {:.1} ms per grab", frames as f64 / started.elapsed().as_secs_f64().max(1e-6), grabber.mean_ms()),
+                    Tone::Value,
+                )
+                .line("failures", failures.to_string(), Tone::Body),
+        );
         std::thread::sleep(pace);
     }
+    ui.finish();
     let elapsed = started.elapsed().as_secs_f64();
-    println!(
-        "  Captured {frames} frame(s) in {elapsed:.1}s ({:.1} fps), {:.1} ms per grab",
-        frames as f64 / elapsed.max(1e-6),
-        grabber.mean_ms()
-    );
+    ui.rows(&[(
+        "captured",
+        format!(
+            "{frames} frame(s) in {elapsed:.1}s ({:.1} fps), {:.1} ms per grab",
+            frames as f64 / elapsed.max(1e-6),
+            grabber.mean_ms()
+        ),
+    )]);
     if failures > 0 {
-        println!("  {failures} grab(s) returned nothing.");
+        ui.event("Capture", format!("{failures} grab(s) returned nothing."));
         if let Some(error) = &grabber.last_error {
-            println!("  last error: {error}");
+            ui.event("Capture", format!("last error: {error}"));
         }
     }
 
     if frames < 3 {
-        println!(
-            "  [FAIL] The window is not giving up any frames. Is it minimized, or is the \
-             game still loading?"
+        ui.event_as(
+            "Fail",
+            Tone::Bad,
+            "The window is not giving up any frames. Is it minimized, or is the game still \
+             loading?",
         );
         return 1;
     }
     let mean_delta = mean(&deltas);
-    let changing = 100.0
-        * deltas.iter().filter(|delta| **delta > 1e-3).count() as f64
+    let changing = 100.0 * deltas.iter().filter(|delta| **delta > 1e-3).count() as f64
         / deltas.len().max(1) as f64;
     if black as f64 > frames as f64 * 0.9 {
-        println!(
-            "  [FAIL] Almost every frame is black. A hardware-accelerated game sometimes \
-             refuses PrintWindow; try borderless windowed mode, or run the game windowed."
+        ui.event_as(
+            "Fail",
+            Tone::Bad,
+            "Almost every frame is black. A hardware-accelerated game sometimes refuses \
+             PrintWindow; try borderless windowed mode, or run the game windowed.",
         );
         return 1;
     }
     if mean_delta < 1e-4 {
-        println!(
-            "  [WARN] The image is not changing at all. The bot will learn nothing from a \
-             still screen: the game is probably paused while unfocused, or the window is \
-             showing a loading screen."
+        ui.event_as(
+            "Warn",
+            Tone::Warn,
+            "The image is not changing at all. The bot will learn nothing from a still \
+             screen: the game is probably paused while unfocused, or the window is showing a \
+             loading screen.",
         );
     } else {
-        println!(
-            "  [OK]   Image is live: mean change {mean_delta:.4}, changing on {changing:.0}% \
-             of frames."
+        ui.event_as(
+            "OK",
+            Tone::Good,
+            format!(
+                "Image is live: mean change {mean_delta:.4}, changing on {changing:.0}% of \
+                 frames."
+            ),
         );
     }
-    println!("{}", "-".repeat(74));
-    println!();
+    ui.blank();
     0
 }
 
@@ -117,37 +136,54 @@ fn mean(values: &[f32]) -> f32 {
 
 /// Every window the bot can see, and which of them it will not drive.
 pub fn list_windows() -> i32 {
+    use crate::ui::{Tone, ui};
+    let ui = ui();
     for line in platform::capability_report() {
-        println!("[Platform] {line}");
+        ui.event("Platform", line);
     }
     let windows = platform::current::enumerate_windows(platform::MIN_AREA);
     if windows.is_empty() {
-        println!("No windows found.");
+        ui.event_as(
+            "Windows",
+            Tone::Warn,
+            "No windows found. `bot1 --platform` says what this build can see here.",
+        );
         return 1;
     }
-    println!();
-    println!("{}", "-".repeat(78));
-    println!("  WINDOWS (pass one to --window HANDLE)");
-    println!("{}", "-".repeat(78));
-    println!("{}", platform::format_window_table(&windows));
-    println!("{}", "-".repeat(78));
+    ui.section("Windows");
+    ui.raw(&platform::format_window_table(&windows));
     let games: Vec<&WindowInfo> = windows
         .iter()
         .filter(|window| platform::looks_like_game(window))
         .collect();
     match games.first() {
         Some(game) => {
-            println!(
-                "  Largest likely game: {} ({}) hwnd={}",
-                game.title, game.process, game.handle
+            ui.event_as(
+                "Pick",
+                Tone::Good,
+                format!(
+                    "Largest likely game: {} ({}) hwnd={} - that is what the bot picks \
+                     automatically.",
+                    game.title, game.process, game.handle
+                ),
             );
-            println!("  That is what the bot picks automatically.");
+            ui.event(
+                "Pick",
+                "`bot1 --window HWND` drives a different one; `bot1 --pick` asks every time.",
+            );
         }
-        None => println!("  Nothing here looks like a game; the bot will ask you to pick."),
+        None => ui.event_as(
+            "Pick",
+            Tone::Warn,
+            "Nothing here looks like a game, so the bot will ask you to pick one.",
+        ),
     }
-    println!("  Marked windows are never auto-selected: the terminal this bot runs");
-    println!("  in, its own console, and programs that are not games.");
-    println!();
+    ui.event(
+        "Pick",
+        "Marked windows are never auto-selected: the terminal this bot runs in, its own \
+         console, and programs that are not games.",
+    );
+    ui.blank();
     0
 }
 
@@ -159,7 +195,9 @@ pub fn list_windows() -> i32 {
 pub fn release_all_keys(cfg: &Config, handle: Handle) -> i32 {
     let keymap = Keymap::load(&cfg.keymap_path).unwrap_or_else(Keymap::default_layout);
     let mut injector = platform::Injector::new(handle, cfg.focus_policy, cfg.clip_cursor);
-    println!("[Release] Lifting every key in the whitelist and all mouse buttons.");
+    let ui = crate::ui::ui();
+    ui.section("Release");
+    ui.line("Lifting every key in the whitelist and all mouse buttons.");
     injector.acquire_focus(true);
     injector.begin_action();
     for code in keymap.vks.values() {
@@ -173,12 +211,18 @@ pub fn release_all_keys(cfg: &Config, handle: Handle) -> i32 {
     // holding the cursor" - the repair is for the run that died, not for this
     // one, which never confined anything.
     platform::free_cursor_clip();
-    println!("[Release] Done. The cursor is free to move anywhere again.");
+    ui.event_as(
+        "Release",
+        crate::ui::Tone::Good,
+        "Done. The cursor is free to move anywhere again.",
+    );
     0
 }
 
 /// What the bot may do, in full: the whitelist and the action space it implies.
 pub fn show_actions(cfg: &Config, mut keymap: Keymap) -> i32 {
+    use crate::ui::{Tone, ui};
+    let ui = ui();
     keymap.set_mouse_turn(if cfg.mouse_turn_pixels == 0 {
         None
     } else {
@@ -193,52 +237,74 @@ pub fn show_actions(cfg: &Config, mut keymap: Keymap) -> i32 {
     );
     let base = keymap.default_mouse_turn.max(1);
 
-    println!();
-    println!("{}", "-".repeat(74));
-    println!("  ACTION SPACE");
-    println!("{}", "-".repeat(74));
-    println!(
-        "  Keymap: {}",
-        keymap.path.clone().unwrap_or_else(|| "(built-in defaults)".to_string())
-    );
-    println!("  {}", keymap.describe());
-    println!("  {}", space.describe());
-    println!();
-    println!(
-        "  Held keys, each decided independently (at most {} at once):",
+    ui.section("Action space");
+    ui.rows(&[
+        (
+            "keymap",
+            keymap
+                .path
+                .clone()
+                .unwrap_or_else(|| "(built-in defaults)".to_string()),
+        ),
+        ("keys", keymap.describe()),
+        ("size", space.describe()),
+    ]);
+
+    ui.section(&format!(
+        "Hold keys - each decided on its own, at most {} at a time",
         space.max_held
-    );
+    ));
     for (index, name) in space.hold_names.iter().enumerate() {
-        println!("    [{index}] {name}");
+        ui.line(&format!("[{index}] {name}"));
     }
-    println!();
-    println!("  Turning (two choices per step: which way, and how fast).");
-    println!("  The base step is the bot's own: it starts at {base}px and the");
-    println!(
-        "  bot moves it inside [{}, {}] pixels as it learns this game.",
-        cfg.mouse_turn_min, cfg.mouse_turn_max
-    );
-    println!("    directions:");
+
+    ui.section("Turning - a direction and a speed every step");
+    ui.rows(&[
+        (
+            "base step",
+            format!(
+                "the bot's own: it starts at {base}px and moves it inside [{}, {}] as it \
+                 learns this game",
+                cfg.mouse_turn_min, cfg.mouse_turn_max
+            ),
+        ),
+    ]);
     for (index, (name, delta)) in space.directions.iter().enumerate() {
         let rendered = if *delta == (0, 0) {
             "do not turn".to_string()
         } else {
             format!("move mouse by {:+}, {:+} per 1x", delta.0, delta.1)
         };
-        println!("      [{index}] {name:<9} {rendered}");
+        ui.line(&format!("[{index}] {name:<9} {rendered}"));
     }
-    println!("    speeds (multipliers on the base step):");
-    for (index, level) in space.speed_levels.iter().enumerate() {
-        let pixels = ((base as f32) * level).round().max(1.0) as i32;
-        println!("      [{index}] x{level:<5} -> {pixels:+}px from the current {base}px base");
-    }
-    println!();
-    println!("  Tap / click (one choice per step):");
+    let speeds: Vec<String> = space
+        .speed_levels
+        .iter()
+        .enumerate()
+        .map(|(index, level)| {
+            let pixels = ((base as f32) * level).round().max(1.0) as i32;
+            format!("[{index}] x{level} -> {pixels:+}px")
+        })
+        .collect();
+    ui.line(&format!("speeds   {}", speeds.join("   ")));
+
+    ui.section("Tap / click - one choice every step");
     for (index, tap) in space.taps.iter().enumerate() {
-        println!("    [{index}] {}", tap.label);
+        ui.line(&format!("[{index}] {}", tap.label));
     }
-    println!("{}", "-".repeat(74));
-    println!();
+    if space.taps.len() > 6 {
+        ui.event_as(
+            "Check",
+            Tone::Warn,
+            format!(
+                "{} tap/click choices are enabled, so a large share of every rollout is \
+                 spent clicking. In a game with an inventory or an attack button this is \
+                 mostly wasted input.",
+                space.taps.len()
+            ),
+        );
+    }
+    ui.blank();
     0
 }
 
@@ -270,7 +336,11 @@ pub fn benchmark<B: burn::tensor::backend::AutodiffBackend>(
     let env = match crate::game::RealGameEnv::new(&bench_cfg, handle, &space, true) {
         Ok(env) => env,
         Err(error) => {
-            println!("[Bench] Could not open the window: {error}");
+            crate::ui::ui().event_as(
+                "Bench",
+                crate::ui::Tone::Bad,
+                format!("Could not open the window: {error}"),
+            );
             return 1;
         }
     };
@@ -283,16 +353,18 @@ pub fn benchmark<B: burn::tensor::backend::AutodiffBackend>(
     ) {
         Ok(session) => session,
         Err(error) => {
-            println!("[Bench] Could not build a session: {error}");
+            crate::ui::ui().event_as(
+                "Bench",
+                crate::ui::Tone::Bad,
+                format!("Could not build a session: {error}"),
+            );
             return 1;
         }
     };
 
-    println!();
-    println!("{}", "-".repeat(74));
-    println!("  BENCHMARK (dry run: nothing is injected)");
-    println!("{}", "-".repeat(74));
-    println!("  {}", cfg.describe());
+    let ui = crate::ui::ui();
+    ui.section("Benchmark - dry run, nothing is injected");
+    ui.rows(&[("config", cfg.describe())]);
 
     // Warm up: the first forward pass initialises buffers that later ones reuse.
     for _ in 0..15 {
@@ -302,14 +374,28 @@ pub fn benchmark<B: burn::tensor::backend::AutodiffBackend>(
     let mut model_times: Vec<f64> = Vec::with_capacity(decisions);
     let mut env_times: Vec<f64> = Vec::with_capacity(decisions);
     let mut action = session.decide();
-    for _ in 0..decisions {
+    for decision in 0..decisions {
         let started = std::time::Instant::now();
         action = session.decide();
         model_times.push(started.elapsed().as_secs_f64() * 1000.0);
         let started = std::time::Instant::now();
         session.step(&action);
         env_times.push(started.elapsed().as_secs_f64() * 1000.0);
+        // The progress bar for a measurement: without it the command looks
+        // hung for as long as it runs.
+        ui.live(
+            &crate::ui::Frame::new("Benchmark")
+                .badge("measuring", crate::ui::Tone::Accent)
+                .meter(
+                    "decisions",
+                    format!("{}/{}", decision + 1, decisions),
+                    (decision + 1) as f32 / decisions.max(1) as f32,
+                    crate::ui::Tone::Accent,
+                )
+                .footer("this measures the loop, not the game's reaction to it"),
+        );
     }
+    ui.finish();
     let median = |values: &mut Vec<f64>| {
         values.sort_by(|a, b| a.total_cmp(b));
         values.get(values.len() / 2).copied().unwrap_or(0.0)
@@ -317,50 +403,73 @@ pub fn benchmark<B: burn::tensor::backend::AutodiffBackend>(
     let model_ms = median(&mut model_times);
     let env_ms = median(&mut env_times);
     let total_ms = model_ms + env_ms;
-    println!("  decision + model : {model_ms:6.2} ms");
-    println!(
-        "  env + capture    : {env_ms:6.2} ms  ({} game step(s), no pacing)",
-        cfg.action_repeat
-    );
-    println!(
-        "  total per step   : {total_ms:6.2} ms  ({:.1} decisions/s)",
-        1000.0 / total_ms.max(1e-6)
-    );
     // One decision covers `action_repeat` game steps, so the budget it has to
     // fit is that many step budgets - not one. Comparing a per-decision cost
     // against a per-step budget is what makes the Python's version report
     // "too slow" on a machine that is keeping up.
     let step_budget_ms = 1000.0 / cfg.target_fps.max(1.0) as f64;
     let decision_budget_ms = step_budget_ms * cfg.action_repeat.max(1) as f64;
-    println!(
-        "  target           : {step_budget_ms:6.2} ms per game step  ({decision_budget_ms:.2} ms \
-         per decision at action_repeat {})",
-        cfg.action_repeat.max(1)
-    );
+    ui.rows(&[
+        ("model", format!("{model_ms:6.2} ms per decision")),
+        (
+            "env + capture",
+            format!(
+                "{env_ms:6.2} ms  ({} game step(s), no pacing)",
+                cfg.action_repeat
+            ),
+        ),
+        (
+            "total",
+            format!(
+                "{total_ms:6.2} ms  ({:.1} decisions/s)",
+                1000.0 / total_ms.max(1e-6)
+            ),
+        ),
+        (
+            "target",
+            format!(
+                "{step_budget_ms:6.2} ms per game step ({decision_budget_ms:.2} ms per \
+                 decision at action_repeat {})",
+                cfg.action_repeat.max(1)
+            ),
+        ),
+    ]);
     if total_ms > decision_budget_ms {
-        println!(
-            "  [WARN] Too slow for the target rate ({total_ms:.0} ms of \
-             {decision_budget_ms:.0} ms). The bot will still run; it will react late."
+        ui.event_as(
+            "Warn",
+            crate::ui::Tone::Warn,
+            format!(
+                "Too slow for the target rate ({total_ms:.0} ms of {decision_budget_ms:.0} \
+                 ms). The bot will still run; it will react late."
+            ),
         );
         if env_ms > model_ms {
-            println!(
-                "         The time is in capture ({env_ms:.0} ms), not the model ({model_ms:.0} \
-                 ms). A big window costs more to grab than a small one; run the game windowed, \
-                 or lower target_fps."
+            ui.event(
+                "Bench",
+                format!(
+                    "The time is in capture ({env_ms:.0} ms), not the model ({model_ms:.0} \
+                     ms). A big window costs more to grab than a small one; run the game \
+                     windowed, or lower target_fps. Cross-check with: bot1 --check-capture"
+                ),
             );
-            println!("         Cross-check with: bot1 --check-capture");
         } else {
-            println!(
-                "         The time is in the model ({model_ms:.0} ms). Lower embed_dim (now \
-                 {}), mem_tokens (now {}), transformer_layers (now {}) or frame_size (now {}).",
-                cfg.embed_dim, cfg.mem_tokens, cfg.transformer_layers, cfg.frame_size
+            ui.event(
+                "Bench",
+                format!(
+                    "The time is in the model ({model_ms:.0} ms). Lower embed_dim (now {}), \
+                     mem_tokens (now {}), transformer_layers (now {}) or frame_size (now {}).",
+                    cfg.embed_dim, cfg.mem_tokens, cfg.transformer_layers, cfg.frame_size
+                ),
             );
         }
     } else {
-        println!("  [OK]   Fast enough for the target rate.");
+        ui.event_as(
+            "OK",
+            crate::ui::Tone::Good,
+            "Fast enough for the target rate.",
+        );
     }
-    println!("{}", "-".repeat(74));
-    println!();
+    ui.blank();
     let _ = action;
     session.close();
     0

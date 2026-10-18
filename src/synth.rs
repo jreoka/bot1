@@ -562,12 +562,20 @@ pub fn run_learning_check<B: AutodiffBackend>(
     cfg.validate()?;
     let mut results = SelfTestResult::default();
 
+    let ui = crate::ui::ui();
     if verbose {
-        println!();
-        println!("{}", "-".repeat(78));
-        println!("  SELF-TEST: can the identical algorithm learn a game it has");
-        println!("  never seen, with no game-specific code and no score reading?");
-        println!("{}", "-".repeat(78));
+        ui.section("Self-test");
+        ui.line(
+            "Can the identical algorithm - same model, same reward, same PPO update - learn \
+             a game it has never seen, with no game-specific code and no score reading?",
+        );
+        ui.rows(&[(
+            "game",
+            format!(
+                "a synthetic corridor {corridor_length} cells long, seen only as pixels; the \
+                 bot has to walk forward to make progress"
+            ),
+        )]);
     }
 
     let env = SyntheticEnv::new(&cfg, corridor_length, 300);
@@ -603,16 +611,39 @@ pub fn run_learning_check<B: AutodiffBackend>(
             session.learn();
             updates_done += 1;
             if verbose {
-                // The Python's self-test says nothing until the end; a line per
-                // update is what makes a run that has stopped learning visible
-                // while it is happening.
-                println!(
-                    "  [selftest] step {:>6}  update {:>3}  {:.1}s  {}  resets {}",
-                    session.total_steps,
-                    updates_done,
-                    started.elapsed().as_secs_f64(),
-                    session.reward.summary(),
-                    session.reward.detector.resets
+                // The Python's self-test says nothing until the end. A panel
+                // that moves is what makes a run that has stopped learning
+                // visible while it is happening.
+                ui.live(
+                    &crate::ui::Frame::new("Learning the corridor")
+                        .badge(format!("update {updates_done}"), crate::ui::Tone::Good)
+                        .line(
+                            "step",
+                            format!("{}/{}", session.total_steps, steps),
+                            crate::ui::Tone::Value,
+                        )
+                        .meter(
+                            "progress",
+                            format!("{:.0}%", 100.0 * session.total_steps as f32 / steps.max(1) as f32),
+                            session.total_steps as f32 / steps.max(1) as f32,
+                            crate::ui::Tone::Accent,
+                        )
+                        .line(
+                            "elapsed",
+                            format!("{:.0}s", started.elapsed().as_secs_f64()),
+                            crate::ui::Tone::Body,
+                        )
+                        .line(
+                            "reward",
+                            session.reward.summary(),
+                            crate::ui::Tone::Body,
+                        )
+                        .line(
+                            "resets",
+                            format!("{} episode reset(s)", session.reward.detector.resets),
+                            crate::ui::Tone::Dim,
+                        )
+                        .footer("the corridor is solved when the bot can walk it end to end"),
                 );
             }
             // Stop as soon as the bot is demonstrably playing the game, rather
@@ -667,16 +698,31 @@ pub fn run_learning_check<B: AutodiffBackend>(
         passed,
     };
     if verbose {
-        println!(
-            "  {:<24} distance {:5.1} -> {:5.1}   random {:5.1}   {} steps in {:5.1}s   {}",
-            check.name,
-            check.before,
-            check.after,
-            baseline,
-            check.steps,
-            elapsed,
-            if passed { "LEARNED" } else { "DID NOT LEARN" }
-        );
+        ui.finish();
+        ui.section("What it did");
+        ui.rows(&[
+            (
+                "distance",
+                format!(
+                    "{:5.1} -> {:5.1} cells (random walk {:5.1})",
+                    check.before, check.after, baseline
+                ),
+            ),
+            (
+                "trained",
+                format!("{} step(s) in {elapsed:.1}s", check.steps),
+            ),
+            (
+                "verdict",
+                if passed {
+                    "LEARNED: it plays the game better than it started, and better than \
+                     chance"
+                        .to_string()
+                } else {
+                    "DID NOT LEARN: it did not improve on where it started".to_string()
+                },
+            ),
+        ]);
     }
     results.passed = passed;
     results.corridor = Some(check);
@@ -688,9 +734,7 @@ pub fn run_learning_check<B: AutodiffBackend>(
     // *ordering*: a policy that walks forward has to earn clearly more per step
     // than one that walks backwards.
     if verbose {
-        println!();
-        println!("  Control: the reward must prefer going forward to going");
-        println!("  backwards, or it is not a progress signal.");
+        ui.section("Controls - two fixed policies, to prove the reward prefers progress");
     }
     let forward_reward = fixed_policy_reward::<B>(
         &cfg,
@@ -715,21 +759,33 @@ pub fn run_learning_check<B: AutodiffBackend>(
     results.backwards_ratio = ratio;
     results.control_passed = control_passed;
     if verbose {
-        println!(
-            "  {:<24} reward/step {:+.4}",
-            "always forward", forward_reward
-        );
-        println!(
-            "  {:<24} reward/step {:+.4}   {:.0}% of forward   {}",
-            "always backwards",
-            control_reward,
-            100.0 * ratio,
-            if control_passed {
-                "correctly lower"
-            } else {
-                "TOO HIGH: the reward can be farmed by dying"
-            }
-        );
+        let tone = if control_passed {
+            crate::ui::Tone::Good
+        } else {
+            crate::ui::Tone::Bad
+        };
+        ui.raw(&ui.render(
+            &crate::ui::Frame::new("Controls")
+                .badge(
+                    if control_passed { "PASS" } else { "FAIL" },
+                    tone,
+                )
+                .line(
+                    "forward",
+                    format!("{forward_reward:+.4} reward/step"),
+                    crate::ui::Tone::Good,
+                )
+                .line(
+                    "backward",
+                    format!("{control_reward:+.4} reward/step  ({:.0}% of forward)", 100.0 * ratio),
+                    tone,
+                )
+                .footer(if control_passed {
+                    "going backwards pays less than going forwards: the reward is progress, not activity"
+                } else {
+                    "TOO HIGH: the reward can be farmed by dying"
+                }),
+        ));
     }
 
     let idle_reward = fixed_policy_reward::<B>(
@@ -746,25 +802,57 @@ pub fn run_learning_check<B: AutodiffBackend>(
     results.idle_ratio = idle_ratio;
     results.idle_passed = idle_passed;
     if verbose {
-        println!(
-            "  {:<24} reward/step {:+.4}   {:.0}% of forward   {}",
-            "never press anything",
-            idle_reward,
+        let ui = crate::ui::ui();
+        ui.finish();
+        ui.line(&format!(
+            "never press anything: {idle_reward:+.4} reward/step, {:.0}% of forward - {}",
             100.0 * idle_ratio,
             if idle_passed {
-                "correctly lower"
+                "correctly lower, so standing still does not pay"
             } else {
                 "TOO HIGH: standing still pays"
             }
-        );
+        ));
     }
 
     results.ok = results.passed && control_passed && idle_passed;
     if verbose {
-        println!("{}", "-".repeat(78));
-        println!("  RESULT: {}", if results.ok { "PASS" } else { "FAIL" });
-        println!("{}", "-".repeat(78));
-        println!();
+        let ui = crate::ui::ui();
+        ui.finish();
+        ui.section("Result");
+        ui.rows(&[
+            ("corridor", format!("{}", if results.passed { "learned" } else { "not learned" })),
+            (
+                "reward",
+                format!(
+                    "{} (forward {:.4} > backwards {:.4} > idle {:.4})",
+                    if control_passed && idle_passed {
+                        "correct"
+                    } else {
+                        "WRONG"
+                    },
+                    forward_reward,
+                    control_reward,
+                    idle_reward
+                ),
+            ),
+        ]);
+        if results.ok {
+            ui.event_as(
+                "Pass",
+                crate::ui::Tone::Good,
+                "The identical algorithm learns a game it has never seen. That is the claim \
+                 this build makes, checked rather than asserted.",
+            );
+        } else {
+            ui.event_as(
+                "Fail",
+                crate::ui::Tone::Bad,
+                "The algorithm did not clear the corridor test on this seed. Run it again \
+                 with a different --seed before treating this as a regression.",
+            );
+        }
+        ui.blank();
     }
     Ok(results)
 }

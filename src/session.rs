@@ -522,6 +522,16 @@ pub struct GameSession<B: AutodiffBackend> {
     turn_decisions: u64,
     turn_observations: u64,
     turn_window: VecDeque<bool>,
+    /// The window title, for the live panel's heading. Set by the caller that
+    /// chose the window; a session with no window (`--selftest`) leaves it.
+    title: String,
+    /// Whether the user has asked the run to pause, as of the last time the
+    /// loop looked. Only the panel needs it, and the loop is where it is known.
+    paused: bool,
+    /// The `--steps` budget, so the panel can count down to it.
+    max_decisions: Option<u64>,
+    /// Mean reward per update, newest last: the shape of the sparkline.
+    reward_history: VecDeque<f32>,
     /// The `--log` file: one JSON object per update, appended.
     ///
     /// A run that is watched for hours needs a record that survives the scroll
@@ -596,6 +606,10 @@ impl<B: AutodiffBackend> GameSession<B> {
             learn_superseded: 0,
             learn_updates: 0,
             learn_disabled_after_nan: false,
+            title: String::new(),
+            paused: false,
+            max_decisions: None,
+            reward_history: VecDeque::new(),
             episodes: 0,
             decisions_made: 0,
             total_steps: 0,
@@ -624,7 +638,11 @@ impl<B: AutodiffBackend> GameSession<B> {
                 {
                     Ok(file) => Some(file),
                     Err(error) => {
-                        println!("[Log] Could not open '{path}': {error}");
+                        crate::ui::ui().event_as(
+                            "Log",
+                            crate::ui::Tone::Bad,
+                            format!("Could not open '{path}': {error}"),
+                        );
                         None
                     }
                 }
@@ -685,21 +703,40 @@ impl<B: AutodiffBackend> GameSession<B> {
         if !control.awaiting_start() {
             return true;
         }
-        println!();
-        println!(
-            "[Control] Ready. Click the game window so it has focus, then press the start key."
-        );
-        println!(
-            "[Control] Nothing is being sent until then, so it is safe to use the terminal."
-        );
+        let ui = crate::ui::ui();
+        let game = if self.title.is_empty() {
+            "the game window".to_string()
+        } else {
+            self.title.clone()
+        };
+        if ui.rich() {
+            ui.panel(
+                "Waiting for the start key",
+                &format!(
+                    "Click {} so it has focus, then press the start key. Nothing is being \
+                     sent until then, so this terminal is safe to use.",
+                    game
+                ),
+                crate::ui::Tone::Accent,
+            );
+        } else {
+            ui.event(
+                "Control",
+                "Ready. Click the game window so it has focus, then press the start key.",
+            );
+            ui.event(
+                "Control",
+                "Nothing is being sent until then, so it is safe to use the terminal.",
+            );
+        }
         while control.awaiting_start() && !control.stop_requested() {
             for message in control.service() {
-                println!("[Control] {message}");
+                ui.event("Control", message);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         if control.stop_requested() {
-            println!("[Control] Quit before starting; nothing was sent.");
+            ui.event("Control", "Quit before starting; nothing was sent.");
             return false;
         }
         true
@@ -736,27 +773,33 @@ impl<B: AutodiffBackend> GameSession<B> {
         // One attempt at the foreground window, now that the user has said "go".
         // Per the focus policy this never happens again on its own.
         self.focus();
+        self.max_decisions = max_decisions;
         self.reset(Some(self.cfg.seed), false);
         self.start_learning_worker();
         if !self.learning_is_offloaded() {
-            println!(
-                "[Learn] The training thread could not be started, so updates will run \
-                 inline and the bot will pause while it learns."
+            crate::ui::ui().event(
+                "Learn",
+                "The training thread could not be started, so updates will run inline and \
+                 the bot will pause while it learns.",
             );
         }
+        self.refresh_live(true);
         let mut last_status = self.total_steps;
 
         while max_decisions.is_none_or(|max| self.total_steps < max) {
             if let Some(inner) = control.as_mut() {
                 for message in inner.service() {
-                    println!("[Control] {message}");
+                    crate::ui::ui().event("Control", message);
                 }
                 if inner.paused() {
                     if inner.claim_pause_notice() {
-                        println!(
-                            "[Control] PAUSED: no input is being sent. Press the pause key \
-                             again to resume."
+                        crate::ui::ui().event(
+                            "Control",
+                            "PAUSED: no input is being sent. Press the pause key again to \
+                             resume.",
                         );
+                        self.paused = true;
+                        self.refresh_live(true);
                     }
                     // Suspending the environment is what actually stops the
                     // input, not merely releasing what is held: without it the
@@ -765,11 +808,14 @@ impl<B: AutodiffBackend> GameSession<B> {
                     self.suspend();
                     while inner.paused() && !inner.stop_requested() {
                         for message in inner.service() {
-                            println!("[Control] {message}");
+                            crate::ui::ui().event("Control", message);
                         }
                         self.release_held();
+                        self.refresh_live(false);
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
+                    self.paused = false;
+                    self.refresh_live(true);
                     self.resume();
                     self.focus();
                     // The world moved on while paused, so the transformer's
@@ -794,6 +840,9 @@ impl<B: AutodiffBackend> GameSession<B> {
             while self.buffer.len() < self.cfg.rollout_steps {
                 let action = self.decide();
                 let (_reward, done, _info) = self.step(&action);
+                // The panel is the run's face: it moves with the run, not with
+                // the periodic report.
+                self.refresh_live(false);
                 if done {
                     // `reset` re-decides for the fresh observation, so the
                     // pending action always matches the pending observation. The
@@ -809,7 +858,7 @@ impl<B: AutodiffBackend> GameSession<B> {
                 // a whole rollout is a checkpoint that is missing when the
                 // machine loses power.
                 for message in inner.service() {
-                    println!("[Control] {message}");
+                    crate::ui::ui().event("Control", message);
                 }
                 let due = inner.checkpoint_due();
                 if let (Some(reason), Some(save)) = (due, save_fn.as_mut()) {
@@ -860,9 +909,13 @@ impl<B: AutodiffBackend> GameSession<B> {
             let bad = Trainer::<B>::nonfinite_parameters(&self.policy);
             if !bad.is_empty() {
                 let shown: Vec<&String> = bad.iter().take(3).collect();
-                println!(
-                    "[Health] Non-finite weights in {shown:?}. Stopping so the previous \
-                     checkpoint stays good."
+                crate::ui::ui().event_as(
+                    "Health",
+                    crate::ui::Tone::Bad,
+                    format!(
+                        "Non-finite weights in {shown:?}. Stopping so the previous checkpoint \
+                         stays good."
+                    ),
                 );
                 break;
             }
@@ -1108,7 +1161,7 @@ impl<B: AutodiffBackend> GameSession<B> {
             .health
             .note_step(delta, engaged, self.reward.episodic_bonus())
         {
-            println!("{message}");
+            crate::ui::ui().event_as("Health", crate::ui::Tone::Warn, message);
         }
 
         self.observation = observation;
@@ -1360,9 +1413,13 @@ impl<B: AutodiffBackend> GameSession<B> {
         if !bad.is_empty() {
             let shown: Vec<&String> = bad.iter().take(3).collect();
             self.learn_disabled_after_nan = true;
-            println!(
-                "[Health] The training thread produced non-finite weights in {shown:?}; its \
-                 output is being discarded."
+            crate::ui::ui().event_as(
+                "Health",
+                crate::ui::Tone::Bad,
+                format!(
+                    "The training thread produced non-finite weights in {shown:?}; its output \
+                     is being discarded."
+                ),
             );
             return;
         }
@@ -1461,18 +1518,27 @@ impl<B: AutodiffBackend> GameSession<B> {
     /// Written as a line rather than reformatted on exit, so a run that is killed
     /// still has every update it completed.
     fn write_log_line(&mut self, metrics: &HashMap<String, f32>) {
+        // The panel's sparkline: one point per update, the same number the log
+        // line carries, so what is drawn and what is recorded agree. Recorded
+        // whether or not there is a file to write it to - `--demo` and a run
+        // with no `--log` still draw a sparkline.
+        let mean_reward = self.window_reward / self.window_reward_steps.max(1) as f32;
+        if mean_reward.is_finite() {
+            self.reward_history.push_back(mean_reward);
+            while self.reward_history.len() > 48 {
+                self.reward_history.pop_front();
+            }
+        }
+        // The window is over either way.
+        self.window_reward = 0.0;
+        self.window_reward_steps = 0;
         let Some(file) = self.log.as_mut() else {
             return;
         };
         let mut record = serde_json::Map::new();
         record.insert("step".into(), self.total_steps.into());
         record.insert("episodes".into(), self.episodes.into());
-        record.insert(
-            "mean_reward".into(),
-            serde_json::Value::from(
-                (self.window_reward / self.window_reward_steps.max(1) as f32) as f64,
-            ),
-        );
+        record.insert("mean_reward".into(), serde_json::Value::from(mean_reward as f64));
         record.insert("seconds".into(), serde_json::Value::from(self.started.elapsed().as_secs_f64()));
         for (name, value) in metrics {
             // A NaN or an infinity is not valid JSON, and a log file one bad
@@ -1485,10 +1551,6 @@ impl<B: AutodiffBackend> GameSession<B> {
             let _ = writeln!(file, "{line}");
             let _ = file.flush();
         }
-        // Whatever this line covered is now reported; the next line starts a
-        // fresh window, so its mean is comparable rather than cumulative.
-        self.window_reward = 0.0;
-        self.window_reward_steps = 0;
     }
 
     // =====================================================================
@@ -1660,6 +1722,11 @@ impl<B: AutodiffBackend> GameSession<B> {
     // Reporting
     // =====================================================================
 
+    /// The periodic report.
+    ///
+    /// Two audiences: a terminal, where the live panel already shows the numbers
+    /// and this only adds the advice the panel cannot carry; and a pipe or a
+    /// log file, where it is still the block of lines it always was.
     pub fn status_block(&mut self) {
         let wall = self.env_seconds + self.update_seconds;
         let env_share = if wall > 0.0 {
@@ -1670,79 +1737,55 @@ impl<B: AutodiffBackend> GameSession<B> {
         let steps = self.status_window_steps.max(1);
         let elapsed = self.started.elapsed().as_secs_f64();
         let rate = self.total_steps as f64 / elapsed.max(1e-6);
-        println!();
-        println!(
-            "[Step {}] {:.1} decisions/s, {:.0}% of wall clock in the game ({:.0}% \
-             training), {} episode(s)",
-            self.total_steps,
-            rate,
-            env_share,
-            100.0 - env_share,
-            self.episodes
-        );
-        println!("          {}", self.trainer.status_line());
-        if self.learn_offloaded {
-            let in_flight = self
-                .learn_worker
-                .as_ref()
-                .map(|worker| worker.in_flight())
-                .unwrap_or(0);
-            let behind = if self.learn_skipped == 0 {
-                String::new()
-            } else {
-                format!(
-                    ", {} rollout(s) dropped because training was still busy",
-                    self.learn_skipped
-                )
-            };
-            println!(
-                "          learning on its own thread: {} update(s) applied, {} in flight{behind}",
-                self.learn_updates, in_flight
-            );
-            if self.learn_disabled_after_nan {
-                println!(
-                    "          [Health] The last update produced non-finite weights and was \
-                     discarded; training continues from the last good set."
-                );
-            }
-            if self.learn_superseded > 0 {
-                // Only one update is ever outstanding, so this cannot happen
-                // through the session's own accounting - which is exactly why it
-                // is worth saying when it does.
-                println!(
-                    "          [Health] {} update(s) finished with a newer one already \
-                     waiting. Training is running further ahead of collection than the \
-                     loop expects.",
-                    self.learn_superseded
-                );
-            }
+
+        // Everything worth saying, collected before either mode prints, so a
+        // terminal and a log file are told the same things.
+        let mut notes: Vec<(String, String)> = Vec::new();
+        let in_flight = self
+            .learn_worker
+            .as_ref()
+            .map(|worker| worker.in_flight())
+            .unwrap_or(0);
+        let behind = if self.learn_skipped == 0 {
+            String::new()
+        } else {
+            format!(
+                ", {} rollout(s) dropped because training was still busy",
+                self.learn_skipped
+            )
+        };
+        if self.learn_disabled_after_nan {
+            notes.push((
+                "Health".to_string(),
+                "The last update produced non-finite weights and was discarded; training \
+                 continues from the last good set."
+                    .to_string(),
+            ));
         }
-        println!(
-            "          {}  | resets {} (last: {}), {} new states/1000 steps, {}% of \
-             steps pressed something",
-            self.reward.summary(),
-            self.reward.detector.resets,
-            if self.reward.detector.last_reason.is_empty() {
-                "-".to_string()
-            } else {
-                self.reward.detector.last_reason.clone()
-            },
-            self.status_novel * 1000 / steps,
-            self.status_engaged * 100 / steps
-        );
-        println!("          {}", self.mouse_speed_line());
-        if let Some(stats) = self.env.input_stats() {
-            println!(
-                "          input: {} - {} event(s) delivered to {}, {} decision(s) \
-                 skipped while unfocused",
-                if stats.focused { "focused" } else { "NOT FOCUSED" },
-                stats.delivered,
-                stats.window,
-                stats.skipped_unfocused
-            );
+        if self.learn_superseded > 0 {
+            notes.push((
+                "Health".to_string(),
+                format!(
+                    "{} update(s) finished with a newer one already waiting. Training is \
+                     running further ahead of collection than the loop expects.",
+                    self.learn_superseded
+                ),
+            ));
+        }
+        if self.status_engaged * 100 / steps > 90 && self.total_steps > 2000 {
+            notes.push((
+                "Run".to_string(),
+                format!(
+                    "Engagement is {}%: the bot is pressing something on almost every step. \
+                     That is not a fault, but a lower tap count (--calibrate) gives the \
+                     policy more room to choose.",
+                    self.status_engaged * 100 / steps
+                ),
+            ));
         }
 
         let total: u64 = self.action_counts.values().sum();
+        let mut decisions: Option<String> = None;
         if total > 0 {
             let mut top: Vec<(String, u64)> = self
                 .action_counts
@@ -1759,22 +1802,23 @@ impl<B: AutodiffBackend> GameSession<B> {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            println!("          decisions: {rendered}");
             if share > 90.0 {
-                println!(
-                    "          [Health] One decision type owns almost every step. Raise \
-                     entropy_coef to push the policy apart, or lower w_idle if it is 'no keys'."
-                );
+                notes.push((
+                    "Health".to_string(),
+                    "One decision type owns almost every step. Raise entropy_coef to push \
+                     the policy apart, or lower w_idle if it is 'no keys'."
+                        .to_string(),
+                ));
             }
+            decisions = Some(rendered);
         }
-        self.action_counts.clear();
 
         for message in self.health.end_window(
             steps,
             self.status_engaged,
             self.trainer.last_update_seconds,
         ) {
-            println!("          {message}");
+            notes.push(("Health".to_string(), message));
         }
         if self.trainer.last_update_seconds > self.cfg.slow_update_seconds as f64 {
             let advice = if self.learn_offloaded {
@@ -1786,15 +1830,237 @@ impl<B: AutodiffBackend> GameSession<B> {
                 "Lower rollout_steps, minibatch_size or seq_len, or raise \
                  update_seconds_budget if the machine can spare it."
             };
-            println!(
-                "          [Health] The last update took {:.1}s. {advice}",
-                self.trainer.last_update_seconds
-            );
+            notes.push((
+                "Health".to_string(),
+                format!(
+                    "The last update took {:.1}s. {advice}",
+                    self.trainer.last_update_seconds
+                ),
+            ));
         }
+
+        let ui = crate::ui::ui();
+        if ui.live_enabled() {
+            // The panel has the numbers; these are the lines that would
+            // otherwise only exist in a scrollback nobody reads.
+            ui.refresh();
+            for (tag, text) in notes {
+                ui.event_as(&tag, crate::ui::Tone::Warn, text);
+            }
+        } else {
+            ui.event(
+                &format!("Step {}", self.total_steps),
+                format!(
+                    "{:.1} decisions/s, {:.0}% of wall clock in the game ({:.0}% training), \
+                     {} episode(s)",
+                    rate,
+                    env_share,
+                    100.0 - env_share,
+                    self.episodes
+                ),
+            );
+            ui.event("Learn", self.trainer.status_line());
+            if self.learn_offloaded {
+                ui.event(
+                    "Learn",
+                    format!(
+                        "learning on its own thread: {} update(s) applied, {} in flight{behind}",
+                        self.learn_updates, in_flight
+                    ),
+                );
+            }
+            let last_reason = if self.reward.detector.last_reason.is_empty() {
+                "-".to_string()
+            } else {
+                self.reward.detector.last_reason.clone()
+            };
+            ui.event(
+                "Reward",
+                format!(
+                    "{}  | resets {} (last: {}), {} new states/1000 steps, {}% of steps \
+                     pressed something",
+                    self.reward.summary(),
+                    self.reward.detector.resets,
+                    last_reason,
+                    self.status_novel * 1000 / steps,
+                    self.status_engaged * 100 / steps
+                ),
+            );
+            ui.event("Input", self.mouse_speed_line());
+            if let Some(stats) = self.env.input_stats() {
+                ui.event(
+                    "Input",
+                    format!(
+                        "{} - {} event(s) delivered to {}, {} decision(s) skipped while \
+                         unfocused",
+                        if stats.focused { "focused" } else { "NOT FOCUSED" },
+                        stats.delivered,
+                        stats.window,
+                        stats.skipped_unfocused
+                    ),
+                );
+            }
+            if let Some(rendered) = decisions {
+                ui.event("Decide", rendered);
+            }
+            for (tag, text) in notes {
+                ui.event_as(&tag, crate::ui::Tone::Warn, &text);
+            }
+        }
+        self.action_counts.clear();
         self.health.start_window();
         self.status_window_steps = 0;
         self.status_engaged = 0;
         self.status_novel = 0;
+    }
+
+    /// The window this run drives, for the panel's heading.
+    pub fn set_title(&mut self, title: impl Into<String>) {
+        self.title = title.into();
+    }
+
+    /// Redraw the panel from the current state.
+    ///
+    /// Called from the collection loop on every decision: the panel throttles
+    /// itself, so this costs a clone of a handful of strings most of the time.
+    pub fn refresh_live(&mut self, force: bool) {
+        let frame = self.live_frame();
+        let ui = crate::ui::ui();
+        if force {
+            ui.live_now(&frame);
+        } else {
+            ui.live(&frame);
+        }
+    }
+
+    /// The run, at this instant, as the live panel draws it.
+    pub fn live_frame(&self) -> crate::ui::Frame {
+        use crate::ui::{Frame, Tone};
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let rate = self.total_steps as f64 / elapsed.max(1e-6);
+        let wall = self.env_seconds + self.update_seconds;
+        let env_share = if wall > 0.0 {
+            100.0 * self.env_seconds / wall
+        } else {
+            100.0
+        };
+        let heading = if self.title.is_empty() {
+            "bot1".to_string()
+        } else {
+            self.title.clone()
+        };
+        let mut frame = Frame::new(heading).badge(
+            if self.paused { "PAUSED" } else { "RUNNING" },
+            if self.paused { Tone::Warn } else { Tone::Good },
+        );
+        let left = self.max_decisions.map(|max| {
+            let remaining = max.saturating_sub(self.total_steps) as f64 / rate.max(1e-6);
+            format!("   {} left", clock(remaining))
+        });
+        frame = frame.line(
+            "steps",
+            format!(
+                "{}   {:.1}/s   {:.0}% in game   {}   {} episode(s){}",
+                crate::ui::thousands(self.total_steps),
+                rate,
+                env_share,
+                clock(elapsed),
+                self.episodes,
+                left.unwrap_or_default()
+            ),
+            Tone::Value,
+        );
+
+        let mean_reward = self.reward.totals.get("total").copied().unwrap_or(0.0)
+            / self.reward.steps.max(1) as f32;
+        frame = frame.spark(
+            "reward",
+            format!("{mean_reward:+.4}/step"),
+            self.reward_history.iter().copied().collect(),
+            if mean_reward >= 0.0 { Tone::Good } else { Tone::Warn },
+        );
+
+        let m = &self.trainer.last_metrics;
+        let get = |name: &str| m.get(name).copied().unwrap_or(0.0);
+        let update = if m.is_empty() {
+            "collecting the first rollout".to_string()
+        } else {
+            format!(
+                "loss {:+.3}   pi {:+.3}   v {:.3}   ent {:.2}   kl {:+.4}   {:.2}s",
+                get("loss"),
+                get("policy_loss"),
+                get("value_loss"),
+                get("entropy"),
+                get("approx_kl"),
+                self.trainer.last_update_seconds
+            )
+        };
+        frame = frame.line("update", update, Tone::Body);
+
+        let collected = self.buffer.len().min(self.cfg.rollout_steps);
+        let fraction = collected as f32 / self.cfg.rollout_steps.max(1) as f32;
+        frame = frame.meter(
+            "rollout",
+            if self.learn_offloaded {
+                format!("{:.0}%  {}/{}", fraction * 100.0, collected, self.cfg.rollout_steps)
+            } else {
+                format!("{}%  {}/{}", (fraction * 100.0) as u32, collected, self.cfg.rollout_steps)
+            },
+            fraction,
+            Tone::Accent,
+        );
+
+        let total: u64 = self.action_counts.values().sum();
+        if total > 0 {
+            let mut top: Vec<(&String, &u64)> = self.action_counts.iter().collect();
+            top.sort_by(|a, b| b.1.cmp(a.1));
+            top.truncate(3);
+            let rendered = top
+                .iter()
+                .map(|(name, count)| format!("{name} {:.0}%", 100.0 * **count as f32 / total as f32))
+                .collect::<Vec<_>>()
+                .join("   ");
+            frame = frame.line("actions", rendered, Tone::Body);
+        }
+
+        if let Some(stats) = self.env.input_stats()
+            && !stats.focused
+        {
+            frame = frame.line(
+                "input",
+                format!(
+                    "NOT FOCUSED - {} decision(s) skipped, nothing is being sent",
+                    stats.skipped_unfocused
+                ),
+                Tone::Bad,
+            );
+        }
+        if self.learn_offloaded {
+            let in_flight = self
+                .learn_worker
+                .as_ref()
+                .map(|worker| worker.in_flight())
+                .unwrap_or(0);
+            frame = frame.line(
+                "learning",
+                format!(
+                    "{} update(s) applied, {} in flight{}",
+                    self.learn_updates,
+                    in_flight,
+                    if self.learn_skipped > 0 {
+                        format!(", {} rollout(s) dropped", self.learn_skipped)
+                    } else {
+                        String::new()
+                    }
+                ),
+                Tone::Dim,
+            );
+        }
+        frame.footer(if self.paused {
+            "F8 resume   F9 save   F10 quit   Ctrl+C stop - nothing is being sent"
+        } else {
+            "F8 pause   F9 save   F10 quit   Ctrl+C stop"
+        })
     }
 
     pub fn hold_keys(&self) -> Vec<u32> {
@@ -1821,12 +2087,26 @@ impl<B: AutodiffBackend> GameSession<B> {
 
     pub fn focus(&mut self) {
         if self.env.acquire_focus() == Some(false) {
-            println!(
-                "[Control] The game window could not be brought forward (Windows allows \
-                 that only from the foreground app). Click the game - input starts on its \
-                 own once the game has focus."
+            crate::ui::ui().event(
+                "Control",
+                "The game window could not be brought forward (Windows allows that only from \
+                 the foreground app). Click the game - input starts on its own once the game \
+                 has focus.",
             );
         }
+    }
+}
+
+/// `01:23:45`, or `-:--:--` for a duration that is not a number.
+fn clock(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "--:--".to_string();
+    }
+    let total = seconds as u64;
+    if total >= 3600 {
+        format!("{:02}:{:02}:{:02}", total / 3600, (total / 60) % 60, total % 60)
+    } else {
+        format!("{:02}:{:02}", total / 60, total % 60)
     }
 }
 

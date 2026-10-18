@@ -21,6 +21,8 @@
 //! control.rs   Ctrl+C, the start/pause/save/quit keys, the checkpoint timer
 //! checkpoint.rs  what a run writes so that stopping is not losing
 //! progress.rs  where each game's training lives, and what it has learned
+//! ui.rs        the terminal: colour, boxes, the live panel, and the plain
+//!              fallback that keeps piped output exactly as it was
 //! platform/    one policy, three mechanisms: which window to drive, and how to
 //!              capture it and press keys into it (Win32 / X11 / CoreGraphics)
 //! ```
@@ -45,6 +47,7 @@ pub mod replay;
 pub mod session;
 pub mod synth;
 pub mod trainer;
+pub mod ui;
 pub mod vision;
 pub mod weights;
 

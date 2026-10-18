@@ -374,9 +374,10 @@ impl Keymap {
         let text = std::fs::read_to_string(path).ok()?;
         let raw: Value = serde_json::from_str(&text).ok()?;
         if !raw.is_object() {
-            println!(
-                "[Keymap] '{}' is not a keymap object; ignoring it.",
-                path.display()
+            crate::ui::ui().event_as(
+                "Keymap",
+                crate::ui::Tone::Warn,
+                format!("'{}' is not a keymap object; ignoring it.", path.display()),
             );
             return None;
         }
@@ -456,9 +457,12 @@ impl Keymap {
         if value <= 0 || value == self.default_mouse_turn {
             return false;
         }
-        println!(
-            "[Keymap] Mouse turn step: {} px (measured) -> {} px (--mouse-turn).",
-            self.default_mouse_turn, value
+        crate::ui::ui().event(
+            "Keymap",
+            format!(
+                "Mouse turn step: {} px (measured) -> {} px (--mouse-turn).",
+                self.default_mouse_turn, value
+            ),
         );
         self.default_mouse_turn = value;
         true

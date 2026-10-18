@@ -449,12 +449,13 @@ dependencies = [
 
 [[package]]
 name = "bot1"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "burn",
  "core-foundation",
  "core-graphics",
+ "libc",
  "rand 0.10.3",
  "serde",
  "serde_json",
