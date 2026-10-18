@@ -58,4 +58,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/${{ matrix.name }}
-          generate_release_notes: true
+          # One explicit body rather than generated notes: three jobs publish to
+          # the same release, and generated notes would be appended once per
+          # platform.
+          body: |
+            Single-file builds of bot1 - no Python, no CUDA, no runtime to install.
+
+            `bot1-windows-x86_64.exe` (static CRT, nothing else needed),
+            `bot1-linux-x86_64`, `bot1-macos-aarch64`.
+
+            First run: open your game in a window, then `bot1 --setup`.
+            After that plain `bot1` continues training; `bot1 --report` says what
+            it has learned. See the README for the rest.

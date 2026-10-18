@@ -250,7 +250,16 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
         ..Default::default()
     };
     let Some(window) = platform::resolve_target_window(&request) else {
-        println!("[Run] No window chosen.");
+        println!("[Run] No window chosen, so there is nothing to drive.");
+        println!(
+            "[Run] `bot1 --list-windows` lists every window this build can see; \
+             `bot1 --window HWND` picks one explicitly."
+        );
+        if !platform::is_supported() {
+            for line in platform::capability_report() {
+                println!("[Platform] {line}");
+            }
+        }
         return code(1);
     };
     let risk = platform::window_risk(Some(&window));
