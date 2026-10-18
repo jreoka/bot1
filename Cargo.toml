@@ -1,6 +1,6 @@
 [package]
 name = "bot1"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
 description = "A game-agnostic bot that learns to play from pixels - Rust port of bot1.py"
