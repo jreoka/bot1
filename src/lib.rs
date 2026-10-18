@@ -1,14 +1,12 @@
 //! bot1, in Rust: a game-agnostic bot that learns to play from pixels.
 //!
-//! The tree mirrors the Python's `botcore/` one module at a time, so the two can
-//! be read side by side while the port is in progress:
+//! The tree, module by module:
 //!
 //! ```text
 //! config.rs    every tunable, with the reasoning next to it
-//! model.rs     the SwiGLU + RoPE transformer: every head, and the next-frame
-//!              prediction the reward reads
-//! weights.rs   reading the Python's weights, which is what the parity test
-//!              needs to prove this computes the same thing
+//! model.rs     the RoPE transformer with a GELU 4x feed-forward: every head,
+//!              and the next-frame prediction the reward reads
+//! weights.rs   reading and writing flat named-tensor files
 //! keys.rs      the calibrated whitelist and the factored action space
 //! vision.rs    the observation, and the coarse fingerprint the reward keys on
 //! replay.rs    fixed-size rollout storage and sequence minibatching
@@ -22,12 +20,15 @@
 //!              there is a window at all
 //! control.rs   Ctrl+C, the start/pause/save/quit keys, the checkpoint timer
 //! checkpoint.rs  what a run writes so that stopping is not losing
+//! progress.rs  where each game's training lives, and what it has learned
 //! platform/    one policy, three mechanisms: which window to drive, and how to
 //!              capture it and press keys into it (Win32 / X11 / CoreGraphics)
 //! ```
 //!
-//! Still to come: frame capture and input injection, hotkeys, calibration,
-//! diagnostics, and the session's checkpointing and CLI.
+//! The source began as a port of a Python prototype, and comments refer to it as
+//! `botcore/`. That tree is not part of this repository; where a comment says
+//! "the Python does X", it means "this is what the original did, and here is
+//! why".
 
 pub mod capture;
 pub mod checkpoint;
@@ -39,6 +40,7 @@ pub mod keys;
 pub mod model;
 pub mod novelty;
 pub mod platform;
+pub mod progress;
 pub mod replay;
 pub mod session;
 pub mod synth;

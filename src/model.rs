@@ -6,7 +6,7 @@
 //! frame stack (C, S, S) -> patch embedding -> tokens (N, E)
 //!                                               |
 //!                         memory window (M, E) -+-> causal transformer
-//!                                                    (RoPE attention + SwiGLU)
+//!                                                    (RoPE attention + GELU MLP)
 //!                                                           |
 //!                                     +---------------------+------------------+
 //!                                     |            |             |            |
@@ -238,40 +238,42 @@ impl HeldCats {
 // Building blocks
 // =============================================================================
 
-/// `SwiGLU(x) = W2( SiLU(W1 x) * W3 x )`, the gated feed-forward every block
-/// uses. Two projections where a plain MLP has one, which is why the hidden
-/// width stays a small multiple of the embedding.
+/// `GELU-MLP(x) = W2( GELU(W1 x) )`, the feed-forward every block uses: a plain
+/// two-layer MLP whose hidden width is four times the embedding, with the exact
+/// `erf` GELU as the activation.
+///
+/// One expansion projection instead of the two a gated unit needs, so at
+/// `4 * embed_dim` it spends the same parameter budget a SwiGLU would at ~2.7x.
 #[derive(Module, Debug)]
-pub struct SwiGlu<B: Backend> {
-    pub gate: Linear<B>,
+pub struct GeluMlp<B: Backend> {
+    /// `dim -> hidden`: the expansion.
     pub up: Linear<B>,
+    /// `hidden -> dim`: the contraction.
     pub down: Linear<B>,
 }
 
-impl<B: Backend> SwiGlu<B> {
+impl<B: Backend> GeluMlp<B> {
     pub fn new(dim: usize, hidden: usize, device: &B::Device) -> Self {
         Self {
-            gate: LinearConfig::new(dim, hidden).with_bias(false).init(device),
             up: LinearConfig::new(dim, hidden).with_bias(false).init(device),
             down: LinearConfig::new(hidden, dim).with_bias(false).init(device),
         }
     }
 
-    /// `W2( SiLU(W1 x) * W3 x )`, on a `(rows, tokens, dim)` tensor.
+    /// `W2( GELU(W1 x) )`, on a `(rows, tokens, dim)` tensor.
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let gated = activation::silu(self.gate.forward(x.clone())) * self.up.forward(x);
-        self.down.forward(gated)
+        self.down.forward(activation::gelu(self.up.forward(x)))
     }
 }
 
-/// Pre-norm attention + SwiGLU, both residual.
+/// Pre-norm attention + GELU MLP, both residual.
 #[derive(Module, Debug)]
 pub struct Block<B: Backend> {
     pub attn_norm: LayerNorm<B>,
     pub qkv: Linear<B>,
     pub attn_out: Linear<B>,
     pub ffn_norm: LayerNorm<B>,
-    pub ffn: SwiGlu<B>,
+    pub ffn: GeluMlp<B>,
 }
 
 /// `(B, C, S, S) -> (B, tokens, embed_dim)`.
@@ -468,7 +470,7 @@ impl<B: Backend> ActorCritic<B> {
                 ffn_norm: LayerNormConfig::new(embed_dim)
                     .with_epsilon(LAYER_NORM_EPS)
                     .init(device),
-                ffn: SwiGlu::new(embed_dim, cfg.ffn_hidden, device),
+                ffn: GeluMlp::new(embed_dim, cfg.ffn_width(), device),
             })
             .collect();
         let net = Net {
@@ -499,7 +501,7 @@ impl<B: Backend> ActorCritic<B> {
                 layers: cfg.transformer_layers.max(1),
                 heads,
                 head_dim,
-                ffn_hidden: cfg.ffn_hidden,
+                ffn_hidden: cfg.ffn_width(),
                 transition_hidden: cfg.transition_hidden,
                 n_keys,
                 n_turn: n_turn.max(1),
@@ -1043,7 +1045,6 @@ impl<B: Backend> ActorCritic<B> {
             {
                 push(&mut out, &format!("{prefix}.{name}"), field);
             }
-            push(&mut out, &format!("{prefix}.ffn.gate.weight"), linear(&block.ffn.gate));
             push(&mut out, &format!("{prefix}.ffn.up.weight"), linear(&block.ffn.up));
             push(&mut out, &format!("{prefix}.ffn.down.weight"), linear(&block.ffn.down));
         }
@@ -1142,12 +1143,6 @@ impl<B: Backend> ActorCritic<B> {
             block.ffn_norm = with_norm(weights, &format!("{prefix}.ffn_norm"), device, embed)?;
             used.push(format!("{prefix}.ffn_norm.weight"));
             used.push(format!("{prefix}.ffn_norm.bias"));
-            block.ffn.gate.weight = weights.param_linear(
-                &format!("{prefix}.ffn.gate.weight"),
-                device,
-                &[embed, d.ffn_hidden],
-            )?;
-            used.push(format!("{prefix}.ffn.gate.weight"));
             block.ffn.up.weight = weights.param_linear(
                 &format!("{prefix}.ffn.up.weight"),
                 device,
@@ -1366,11 +1361,6 @@ impl<B: Backend> ActorCritic<B> {
             block.attn_out.weight = Param::from_tensor(tensor2(
                 transpose(&attention_out, embed, inner),
                 [inner, embed],
-            ));
-            let gate = orthogonal_values(d.ffn_hidden, embed, 1.0, rng);
-            block.ffn.gate.weight = Param::from_tensor(tensor2(
-                transpose(&gate, d.ffn_hidden, embed),
-                [embed, d.ffn_hidden],
             ));
             let up = orthogonal_values(d.ffn_hidden, embed, 1.0, rng);
             block.ffn.up.weight = Param::from_tensor(tensor2(
@@ -1664,20 +1654,21 @@ mod tests {
         let model = test_model(&cfg);
         let block = &model.net.blocks[0];
 
-        // The Python's gains: 1.0 for the feed-forward's two input projections,
-        // 0.5 for every output projection.
-        let gate = block
+        // The Python's gains: 1.0 for the feed-forward's expansion, 0.5 for
+        // every output projection.
+        let up = block
             .ffn
-            .gate
+            .up
             .weight
             .val()
             .into_data()
             .to_vec::<f32>()
             .unwrap();
         assert!(
-            gram_error(&gate, cfg.embed_dim, cfg.ffn_hidden, 1.0) < 1e-4,
-            "the SwiGLU gate should be orthogonal with gain 1.0"
+            gram_error(&up, cfg.embed_dim, cfg.ffn_width(), 1.0) < 1e-4,
+            "the MLP expansion should be orthogonal with gain 1.0"
         );
+        let hidden = cfg.ffn_width();
         let down = block
             .ffn
             .down
@@ -1687,9 +1678,9 @@ mod tests {
             .to_vec::<f32>()
             .unwrap();
         assert!(
-            gram_error(&down, cfg.ffn_hidden, cfg.embed_dim, 0.5) < 1e-4,
-            "the SwiGLU down projection should be orthogonal with gain 0.5 (error {})",
-            gram_error(&down, cfg.ffn_hidden, cfg.embed_dim, 0.5)
+            gram_error(&down, hidden, cfg.embed_dim, 0.5) < 1e-4,
+            "the MLP contraction should be orthogonal with gain 0.5 (error {})",
+            gram_error(&down, hidden, cfg.embed_dim, 0.5)
         );
         // `qkv` is the one projection whose two axes differ in meaning: the
         // stored shape is (embed, 3 * inner), and it is the 96 rows that carry

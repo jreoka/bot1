@@ -1,0 +1,61 @@
+name: build
+
+# Two jobs, one file: every push is tested, and a tag produces the single-file
+# binaries the README tells people to download. A user should never have to
+# build this from source to try it.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
+
+  binaries:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: bot1-linux-x86_64
+            file: target/release/bot1
+          - os: windows-latest
+            name: bot1-windows-x86_64.exe
+            file: target/release/bot1.exe
+          - os: macos-latest
+            name: bot1-macos-aarch64
+            file: target/release/bot1
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Stage the binary under its platform name
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.file }}" "dist/${{ matrix.name }}"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.name }}
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.name }}
+          generate_release_notes: true

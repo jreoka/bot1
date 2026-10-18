@@ -1,0 +1,187 @@
+# bot1
+
+A game-agnostic bot that learns to play by looking at the screen.
+
+It captures a game window, decides what to press (keys, mouse look, clicks), watches what
+changed, and learns from that. Nothing about any particular game is hard-coded: no memory
+reading, no game-specific hooks, no score parsing. It only ever sees pixels and it only ever
+acts through the keyboard and mouse.
+
+```text
+        screen ──▶ frames ──▶ patch tokens ──▶ RoPE transformer ──▶ keys / look / click
+                                                    │
+                                        "what will the next frame look like?"
+                                                    │
+                                             reward ──▶ PPO update
+```
+
+## Install
+
+Prebuilt single-file binaries are on the [releases page](https://github.com/jreoka/bot1/releases)
+(Windows `.exe`, Linux, macOS). Nothing else has to be installed - no Python, no CUDA, no
+driver beyond the OS itself.
+
+Building it yourself takes one command and about five minutes on a laptop:
+
+```bash
+cargo build --release      # target/release/bot1
+```
+
+On Linux the binary talks X11 directly and needs no `libX11`; on macOS it uses CoreGraphics;
+on Windows it uses Win32. A headless machine can still build and run `--selftest`,
+`--report` and every unit test - only driving a window needs a desktop.
+
+## Use
+
+1. Start the game, in a **window**. (Exclusive fullscreen cannot be captured or driven.)
+2. Run it once to teach it your keys, and let it start learning:
+
+   ```bash
+   bot1 --setup
+   ```
+
+   It asks which window to drive, then watches you play for a moment and writes down the
+   keys you actually use. Only those keys are ever pressed from then on. Then training
+   starts: nothing is sent until you press **F8**.
+3. Leave it running. Press **F8** to pause, **F9** to save, **F10** to stop (or Ctrl+C -
+   every key is released first, always).
+4. Tomorrow, open the same game and run `bot1` again. It picks up exactly where it left off.
+5. Ask what it has learned:
+
+   ```bash
+   bot1 --report
+   ```
+
+After that, plain `bot1` is the only command you need.
+
+## Does it actually learn?
+
+Yes, and it is checked rather than claimed. `bot1 --selftest` trains the *identical* code -
+same model, same reward, same PPO update - on a synthetic corridor it has never seen, and
+compares three things:
+
+- how far the policy gets before and after training,
+- how far an agent pressing keys at random gets (the control that makes "it improved" mean
+  something),
+- whether the reward prefers walking forward to walking backward or standing still.
+
+```bash
+bot1 --selftest                    # ~24k decisions, a few minutes
+bot1 --selftest --steps 6000       # a quicker look
+bot1 --selftest --frame-size 64    # faster still on a weak machine
+```
+
+A real game is much harder than that corridor. Expect hours of play, not minutes, before
+something recognisable emerges - and expect it to be bad for a long time first. That is what
+"learns over time" means here: the thing that makes it usable is that stopping does not lose
+anything, and every session starts from what the last one learned.
+
+## Where it keeps what it learned
+
+```text
+runs/<game>/
+  checkpoints/     last.safetensors, numbered copies, index.json
+  training.jsonl   one JSON object per update: step, episodes, mean_reward, loss, ...
+  model.safetensors what the last session ended with
+  session.json     which window this directory belongs to
+```
+
+Every game gets its own directory, named after its window title. A policy trained on one game
+is never silently resumed into another, and `bot1 --report` reads those files, so it works with
+no game running.
+
+Calibrating *more* keys later does not throw that away: the part of the model that understands
+the game carries over, and only the key-choice heads are re-initialised for the wider action
+space.
+
+## Controls
+
+| Key | What it does |
+| --- | --- |
+| **F8** | start (first press) / pause / resume |
+| **F9** | save a checkpoint now |
+| **F10** | save and stop |
+| **Ctrl+C** | save and stop, releasing every held key first |
+
+Nothing is sent while the game window is not in front, and the bot refuses to drive its own
+terminal or a window belonging to the shell that launched it.
+
+## What the flags are for
+
+Everyday:
+
+| Flag | Meaning |
+| --- | --- |
+| `--setup` | calibrate keys, then train (first run) |
+| `--report [DIR]` | what it has learned so far |
+| `--window HWND` | drive a specific window (see `--list-windows`) |
+| `--steps N` | stop after N decisions |
+| `--fresh` | ignore existing checkpoints |
+| `--dry-run` | run the whole loop, inject nothing |
+| `--checkpoint-dir DIR` | put this game's runs somewhere else |
+| `--runs-dir DIR` | where the per-game directories live (default `runs/`) |
+
+Diagnostics, when something looks wrong:
+
+| Flag | Meaning |
+| --- | --- |
+| `--list-windows` | every window it can see, and which it refuses |
+| `--check-capture` | what the capture actually yields, for five seconds |
+| `--actions` | the key whitelist and the action space it implies |
+| `--benchmark` | what one decision costs here (capture vs model) |
+| `--platform` | what this build can and cannot do on this OS |
+| `--hotkeys` | register F8/F9/F10 and report what arrives |
+
+Tuning, if you want to experiment: `--fps`, `--frame-size`, `--rollout`, `--lr`,
+`--entropy`, `--update-budget`, `--checkpoint-every`, `--max-held-keys`, `--embed-dim`,
+`--layers`, `--mouse-turn`. Every field also has a `BOT_<FIELD>` environment override.
+
+## When it does not work
+
+**It sits there and nothing happens.** Nothing is sent before the first F8, by design. If
+that key cannot be registered the bot says so and starts immediately.
+
+**The screen never changes / capture is black.** The game is probably paused while unfocused
+or running exclusive fullscreen. Use borderless windowed and turn off "pause when unfocused".
+`--check-capture` says exactly what it sees.
+
+**It never presses anything.** The key whitelist is what it may press. Run `--setup` (or
+`--calibrate`) and actually play for a bit - `--actions` shows what it learned.
+
+**It is slow.** The model is a small transformer on the CPU; `--benchmark` reports the split
+between capture and inference. Lower `--frame-size` or `--rollout` if the machine is weak.
+
+**It was learning and then stopped getting better.** `--report` says whether the reward has
+flattened. Usually the action set cannot reach new situations: calibrate again with the keys
+that open the next part of the game.
+
+## How it works
+
+A few choices matter more than the rest:
+
+- **The observation is grey frames plus a frame-difference channel.** Colour triples the
+  input cost for very little control information; the difference channel is what lets motion
+  be seen without inferring it from appearance.
+- **The policy is one small transformer** (RoPE attention, GELU feed-forward at 4x the
+  embedding, a rolling memory window) with factored heads: which keys to hold, which way to
+  look, how far, and one momentary button. Factored because a flat action space over nine
+  keys and four look directions is thousands of mostly-nonsense combinations.
+- **The reward is intrinsic.** Progress is "this screen is new, and getting here took
+  effort": episodic novelty, depth into the level, and persistence, with penalties for
+  standing still and for dying. It is never told what the score is.
+- **The critic and the curiosity head share the transformer.** The model predicts the next
+  frame's representation as one of its own heads; its prediction error is the novelty signal.
+- **Updates run on their own thread**, so the bot keeps playing while it learns instead of
+  freezing for a second every rollout.
+- **Stopping is not losing.** Checkpoints carry the weights, the step and episode counters,
+  the reward's running estimates, and the bot's own mouse speed.
+
+## Tests
+
+```bash
+cargo test              # unit and integration tests
+bot1 --selftest         # the learning check end to end
+```
+
+The self-test is the one that matters: it fails if the algorithm stops learning, if the
+reward can be farmed by dying, or if standing still pays.

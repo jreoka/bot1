@@ -430,8 +430,8 @@ impl<B: AutodiffBackend> Trainer<B> {
         for (index, block) in net.blocks.iter().enumerate() {
             check(&format!("blocks.{index}.qkv"), block.qkv.weight.val(), &mut bad);
             check(
-                &format!("blocks.{index}.ffn.gate"),
-                block.ffn.gate.weight.val(),
+                &format!("blocks.{index}.ffn.up"),
+                block.ffn.up.weight.val(),
                 &mut bad,
             );
             check(

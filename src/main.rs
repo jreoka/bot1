@@ -1,10 +1,11 @@
-//! bot1, in Rust.
+//! bot1's command line: the run, and the checks around it.
 //!
-//! Stage 2 of the port: the model, the reward, PPO and the synthetic game are
-//! all in place, and `--selftest` runs the real algorithm against a game whose
-//! progress is known. The Win32 layer and the session's checkpointing arrive
-//! next, so today this binary runs the self-test and says what it is waiting for
-//! otherwise.
+//! `bot1` with no flags trains on a game window, and every game's training lives
+//! in its own directory under `runs/` so that stopping is not losing and running
+//! it again tomorrow continues from there. `--setup` is the first-run path
+//! (calibrate the keys, then train), and `--report` says what it has learned so
+//! far. Everything else is a diagnostic: what the bot can see, what it may
+//! press, what a step costs, and whether the algorithm still learns at all.
 
 use std::cell::RefCell;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -43,6 +44,13 @@ fn main() -> anyhow::Result<()> {
     if arguments.iter().any(|argument| argument == "--list-windows") {
         return code(bot1::diagnostics::list_windows());
     }
+    if arguments.iter().any(|argument| argument == "--report") {
+        return report(&arguments);
+    }
+    if arguments.iter().any(|argument| argument == "--version") {
+        println!("bot1 {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if arguments.iter().any(|argument| argument == "--platform") {
         return platform_report();
     }
@@ -63,6 +71,12 @@ fn main() -> anyhow::Result<()> {
     }
     if arguments.iter().any(|argument| argument == "--calibrate") {
         return calibrate(value_of("--window", 0), value_of("--seconds", 0));
+    }
+    // The one-command path: learn the keys, then start learning the game, in a
+    // single process. This is what the README tells a new user to type.
+    if arguments.iter().any(|argument| argument == "--setup") {
+        calibrate(value_of("--window", 0), value_of("--seconds", 0))?;
+        return train(&arguments);
     }
     // Anything that is not one of the modes above is a run, which is what the
     // Python does with no flags at all.
@@ -114,6 +128,11 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
             .and_then(|value| value.parse::<f32>().ok())
         {
             cfg.checkpoint_interval_sec = seconds;
+        }
+    }
+    if let Some(index) = arguments.iter().position(|a| a == "--runs-dir") {
+        if let Some(directory) = arguments.get(index + 1) {
+            cfg.runs_dir = directory.clone();
         }
     }
     if let Some(index) = arguments.iter().position(|a| a == "--checkpoint-dir") {
@@ -211,8 +230,8 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
     match &keymap {
         Some(keymap) => println!("[Keymap] {}", keymap.describe()),
         None => println!(
-            "[Keymap] No '{}': using built-in defaults. Run --calibrate once so the bot may \
-             only press the keys you actually use.",
+            "[Keymap] No '{}': using built-in defaults. Run `bot1 --setup` (or --calibrate) \
+             once so the bot may only press the keys you actually use.",
             cfg.keymap_path
         ),
     }
@@ -250,6 +269,54 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
         true,
         true,
     );
+
+    // ---- where this game's training lives ----------------------------------
+    //
+    // Every game gets its own directory under `runs/`, named after its window,
+    // so the policy that learned one game is never resumed into another and
+    // "keep training it" is the same command as "start training it". An
+    // explicit --checkpoint-dir or BOT_CHECKPOINT_DIR opts out and is used
+    // verbatim, which is what scripts already rely on.
+    let explicit_checkpoints =
+        has("--checkpoint-dir") || std::env::var("BOT_CHECKPOINT_DIR").is_ok();
+    let explicit_log = has("--log") || std::env::var("BOT_LOG_JSON").is_ok();
+    let game_title = if window.title.is_empty() {
+        window.process.clone()
+    } else {
+        window.title.clone()
+    };
+    let run = if explicit_checkpoints {
+        bot1::progress::RunDir::at(&cfg.checkpoint_dir)
+    } else {
+        bot1::progress::RunDir::new(&cfg.runs_dir, &game_title)
+    };
+    if !explicit_checkpoints {
+        cfg.checkpoint_dir = run.checkpoints().to_string_lossy().to_string();
+    }
+    if !explicit_log {
+        cfg.log_json = Some(run.log().to_string_lossy().to_string());
+    }
+    let _ = run.note_window(&game_title, &window.process);
+
+    println!(
+        "[Run] This game trains in {} - stopping and running again continues from there.",
+        run.root.display()
+    );
+    let existing = bot1::progress::read(&run);
+    if existing.steps > 0 {
+        println!(
+            "[Run] {} decision(s) learned so far over {} episode(s). {}",
+            existing.steps,
+            existing.episodes,
+            existing.verdict()
+        );
+    } else if !explicit_checkpoints {
+        println!(
+            "[Run] First session on this game. It starts knowing nothing; \
+             --report shows what it has learned."
+        );
+    }
+
     for warning in bot1::diagnostics::preflight(&cfg, Some(&keymap), Some(&window)) {
         println!("[Check] {warning}");
     }
@@ -285,7 +352,22 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
                 meta.episodes,
                 path.display()
             ),
-            Err(error) => println!("[Resume] Checkpoint not usable ({error}); starting fresh."),
+            Err(error) => {
+                // A checkpoint that no longer fits - a keymap that gained or
+                // lost keys - still holds the part that understands the game.
+                // Keep what transfers instead of starting from nothing.
+                match session.warm_start(&path) {
+                    Ok(matched) => println!(
+                        "[Resume] {} does not fit this action space ({error}), so its \
+                         decision heads were re-initialised; the other {matched} weight(s) \
+                         carry on from where they were.",
+                        path.display()
+                    ),
+                    Err(_) => println!(
+                        "[Resume] Checkpoint not usable ({error}); starting fresh."
+                    ),
+                }
+            }
         }
     } else if !manager.list_kept().is_empty() {
         println!(
@@ -452,11 +534,12 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
         // that ends without a checkpoint is a run that lost everything since the
         // last one.
         if session.total_steps > 0 {
-            let final_path = manager.directory.join("final.safetensors");
+            let final_path = run.model();
             match session.save_checkpoint(&final_path) {
                 Ok(()) => println!(
-                    "[Checkpoint] step {} (final): final.safetensors",
-                    session.total_steps
+                    "[Checkpoint] step {} (final): {}",
+                    session.total_steps,
+                    final_path.display()
                 ),
                 Err(error) => println!("[Checkpoint] FAILED to save the final model: {error}"),
             }
@@ -477,6 +560,60 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
 /// A checkpoint's staged bytes on their way back from the writing thread, with
 /// the outcome of writing them.
 type StagedCheckpoint = (bot1::checkpoint::CheckpointPlan, anyhow::Result<()>);
+
+/// `--report [DIR]`: what the bot has learned, without a game running.
+///
+/// With no argument it reports every game it has trained, newest first. With a
+/// directory it reports that one - `runs/<game>` as printed at startup.
+fn report(arguments: &[String]) -> anyhow::Result<()> {
+    use bot1::progress::{self, RunDir};
+    let target = arguments
+        .iter()
+        .position(|argument| argument == "--report")
+        .and_then(|index| arguments.get(index + 1))
+        .filter(|value| !value.starts_with("--"));
+
+    let directories: Vec<RunDir> = match target {
+        Some(path) => vec![RunDir::at(path)],
+        None => {
+            let base = arguments
+                .iter()
+                .position(|argument| argument == "--runs-dir")
+                .and_then(|index| arguments.get(index + 1))
+                .cloned()
+                .unwrap_or_else(|| bot1::Config::default().env_overrides().runs_dir);
+            RunDir::list(&base)
+        }
+    };
+
+    if directories.is_empty() {
+        println!();
+        println!("  Nothing has been trained yet.");
+        println!(
+            "  Start a game, then run `bot1` - it picks the window and begins learning, and"
+        );
+        println!("  writes everything it learns to runs/<game>/.");
+        println!();
+        return code(0);
+    }
+
+    println!();
+    println!("{}", "-".repeat(78));
+    println!("  WHAT THE BOT HAS LEARNED");
+    println!("{}", "-".repeat(78));
+    for directory in directories {
+        let progress = progress::read(&directory);
+        println!();
+        print!("{}", progress::render(&progress));
+    }
+    println!();
+    println!("{}", "-".repeat(78));
+    println!(
+        "  Training continues where it left off: run `bot1` again with the same game open."
+    );
+    println!();
+    code(0)
+}
 
 /// `--benchmark [--window HANDLE] [--decisions N]`: what a step costs here.
 fn benchmark(configured: u64, decisions: u64) -> anyhow::Result<()> {
@@ -712,7 +849,15 @@ fn print_help() {
     println!(
         "bot1 {} - a game-agnostic bot that learns to play from pixels\n\
          \n\
-         Run it with no flags to train on a game window:\n\
+         The short version:\n\
+         \n\
+         \x20 1. open the game, windowed (not fullscreen-exclusive)\n\
+         \x20 2. bot1 --setup          learn your keys, then start learning\n\
+         \x20 3. let it run. F8 pauses, F9 saves, F10 quits. Run it again tomorrow\n\
+         \x20    and it continues from what it learned - same game, same folder.\n\
+         \x20 4. bot1 --report         what it has learned so far\n\
+         \n\
+         Running it with no flags just trains on a window:\n\
          \n\
          \x20 bot1                     pick a window, wait for the start key, learn\n\
          \x20 bot1 --window HWND       drive a specific window (see --list-windows)\n\
@@ -721,6 +866,10 @@ fn print_help() {
          \n\
          Modes:\n\
          \n\
+         \x20 --setup      calibrate the keys (watching you play), then train - the\n\
+         \x20               first run in one command\n\
+         \x20 --report     how much this bot has learned: steps, episodes, and whether\n\
+         \x20               the reward is improving. Works with no game running\n\
          \x20 --selftest    prove the identical algorithm learns a game it has\n\
          \x20               never seen, on a synthetic corridor whose progress is\n\
          \x20               known, with a random-action baseline and controls\n\
@@ -732,9 +881,14 @@ fn print_help() {
          \x20 --benchmark   what one decision costs here, model against capture\n\
          \x20 --hotkeys     register F8/F9/F10 and report what arrives\n\
          \x20 --platform    what this build can and cannot do on this OS\n\
+         \x20 --version     print the version\n\
          \n\
          Options: --seed N, --steps N, --window N, --fps N, --focus once|always|never,\n\
-         \x20 --no-hotkeys, --no-clip-cursor, --start-now, --pick, --dry-run, --decisions N.\n\
+         \x20 --no-hotkeys, --no-clip-cursor, --start-now, --pick, --dry-run,\n\
+         \x20 --checkpoint-dir DIR, --calibrate --seconds N.\n\
+         \n\
+         Each game's training lives in runs/<game>/: checkpoints, a log line per\n\
+         update, and the model it ended with. --checkpoint-dir overrides that.\n\
          \n\
          The cursor is confined to the game window while the bot moves it, so a game\n\
          that frees the cursor (an inventory) cannot have clicks land outside it;\n\

@@ -528,6 +528,14 @@ pub struct GameSession<B: AutodiffBackend> {
     /// buffer, and a line per update is what makes "when did it stop improving"
     /// a question with an answer.
     log: Option<std::fs::File>,
+    /// Reward summed since the last log line, and the steps it covered.
+    ///
+    /// The reward module keeps running totals for its own report; this is what
+    /// answers "is it doing better than an hour ago" in the training log, since
+    /// a per-update mean is comparable across sessions and a running total is
+    /// not.
+    window_reward: f32,
+    window_reward_steps: u64,
 }
 
 impl<B: AutodiffBackend> GameSession<B> {
@@ -624,6 +632,8 @@ impl<B: AutodiffBackend> GameSession<B> {
             rng: <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(
                 cfg.seed ^ 0x9E37_79B9_7F4A_7C15,
             ),
+            window_reward: 0.0,
+            window_reward_steps: 0,
             cfg,
             action_space,
             policy,
@@ -1105,6 +1115,8 @@ impl<B: AutodiffBackend> GameSession<B> {
         self.observation_signature = signature;
         self.decisions_made += 1;
         self.total_steps += 1;
+        self.window_reward += reward;
+        self.window_reward_steps += 1;
         self.status_window_steps += 1;
         if engaged {
             self.status_engaged += 1;
@@ -1454,10 +1466,14 @@ impl<B: AutodiffBackend> GameSession<B> {
         };
         let mut record = serde_json::Map::new();
         record.insert("step".into(), self.total_steps.into());
+        record.insert("episodes".into(), self.episodes.into());
         record.insert(
-            "seconds".into(),
-            serde_json::Value::from(self.started.elapsed().as_secs_f64()),
+            "mean_reward".into(),
+            serde_json::Value::from(
+                (self.window_reward / self.window_reward_steps.max(1) as f32) as f64,
+            ),
         );
+        record.insert("seconds".into(), serde_json::Value::from(self.started.elapsed().as_secs_f64()));
         for (name, value) in metrics {
             // A NaN or an infinity is not valid JSON, and a log file one bad
             // number away from being unparseable is worse than a missing field.
@@ -1469,6 +1485,10 @@ impl<B: AutodiffBackend> GameSession<B> {
             let _ = writeln!(file, "{line}");
             let _ = file.flush();
         }
+        // Whatever this line covered is now reported; the next line starts a
+        // fresh window, so its mean is comparable rather than cumulative.
+        self.window_reward = 0.0;
+        self.window_reward_steps = 0;
     }
 
     // =====================================================================
@@ -1547,6 +1567,74 @@ impl<B: AutodiffBackend> GameSession<B> {
         self.total_steps = meta.step;
         self.episodes = meta.episodes;
         Ok(meta)
+    }
+
+    /// Keep whatever a checkpoint still means, even when its action space does
+    /// not match this one.
+    ///
+    /// A keymap that gains or loses a key changes the head sizes, and
+    /// [`Self::load_checkpoint`] refuses the file outright - correctly, since
+    /// the heads cannot be assigned. But the trunk is the part that understands
+    /// the *game*: the patch embedding, the transformer, the curiosity head. It
+    /// has nothing to do with which keys exist. Throwing it away because a user
+    /// calibrated two more keys would throw away every hour invested so far, so
+    /// this keeps every tensor whose name and shape still fit and re-initialises
+    /// only the ones that do not.
+    ///
+    /// The counters and the reward's running estimates describe the game too, so
+    /// they come back with the trunk when the file carries them.
+    pub fn warm_start(&mut self, path: impl AsRef<std::path::Path>) -> anyhow::Result<usize> {
+        let weights = crate::weights::Weights::open(path.as_ref())?;
+        // Start from the model's own (freshly initialised) tensors, so anything
+        // the checkpoint cannot supply keeps a sane initial value rather than
+        // being left as whatever was in memory.
+        let mut combined = self.policy.to_weights();
+        let mut matched = 0usize;
+        for (name, shape, values) in combined.iter_mut() {
+            let Ok(file_shape) = weights.shape(name) else {
+                continue;
+            };
+            if file_shape != shape.as_slice() {
+                continue;
+            }
+            let Ok(file_values) = weights.f32(name) else {
+                continue;
+            };
+            *values = file_values;
+            matched += 1;
+        }
+        anyhow::ensure!(
+            matched > 0,
+            "nothing in {} has a shape this model can use",
+            path.as_ref().display()
+        );
+
+        // `load` reads a tensor file by name, so the merged set is written to a
+        // temporary one and read straight back.
+        let temporary = std::env::temp_dir().join(format!(
+            "bot1-warm-start-{}.safetensors",
+            std::process::id()
+        ));
+        crate::weights::write_safetensors(&temporary, &combined)?;
+        let merged = crate::weights::Weights::open(&temporary);
+        let _ = std::fs::remove_file(&temporary);
+        self.policy.load(&merged?, &self.device)?;
+        self.refresh_acting();
+
+        if let Ok(meta) = crate::checkpoint::SessionMeta::from_metadata(&weights.metadata()) {
+            self.policy.set_mouse_step(Some(meta.mouse_step));
+            self.acting.mouse_step = self.policy.mouse_step;
+            self.reward.error_running.load((
+                meta.error_mean,
+                meta.error_var,
+                meta.error_count,
+            ));
+            self.reward.detector.ambient = meta.ambient;
+            self.reward.steps = meta.reward_steps;
+            self.total_steps = meta.step;
+            self.episodes = meta.episodes;
+        }
+        Ok(matched)
     }
 
     /// Value of the current observation, for the GAE tail.

@@ -216,3 +216,77 @@ fn the_exported_weights_load_back_identical() {
         );
     }
 }
+
+/// Calibrating more keys changes the head shapes, which makes a checkpoint
+/// unusable through `load_checkpoint`. Everything that does not depend on the
+/// action space must still carry over - that is the difference between "add a
+/// key" and "throw away every hour of training".
+#[test]
+fn a_wider_action_space_warm_starts_from_what_still_fits() {
+    let narrow_cfg = synthetic_train_config(48, 64, 3);
+    let mut session = build(&narrow_cfg);
+    session.reset(Some(7), false);
+    for _ in 0..40 {
+        let action = session.decide();
+        session.step(&action);
+    }
+
+    let directory = std::env::temp_dir().join("bot1-checkpoint-warm-start");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("checkpoint.safetensors");
+    session.save_checkpoint(&path).expect("the checkpoint saves");
+    let saved_step = session.total_steps;
+
+    // The same game with the real nine-key layout: the trunk fits, the heads do
+    // not.
+    let device = Default::default();
+    let keymap = bot1::keys::Keymap::default_layout();
+    let wide = bot1::keys::ActionSpace::build(
+        &keymap,
+        narrow_cfg.max_held_keys,
+        &narrow_cfg.speed_levels,
+        true,
+        true,
+    );
+    let mut wider = GameSession::<Backend>::new(
+        &narrow_cfg,
+        Box::new(SyntheticEnv::new(&narrow_cfg, 20, 100)),
+        wide,
+        None,
+        device,
+    )
+    .expect("a session with a wider action space");
+
+    // Strictly refused, as before.
+    assert!(wider.load_checkpoint(&path).is_err());
+
+    let matched = wider
+        .warm_start(&path)
+        .expect("the trunk of the checkpoint still fits");
+    assert!(
+        matched > 0,
+        "a warm start that transfers nothing is not a warm start"
+    );
+    // Every non-head tensor came back...
+    let source = bot1::weights::Weights::open(&path).unwrap();
+    let restored = wider.policy.to_weights();
+    let find = |name: &str| {
+        restored
+            .iter()
+            .find(|(tensor, _, _)| tensor == name)
+            .map(|(_, _, values)| values.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        find("patch_embed.proj.weight"),
+        source.f32("patch_embed.proj.weight").unwrap(),
+        "the patch embedding must survive a changed action space"
+    );
+    assert!(
+        !find("hold_head.weight").is_empty(),
+        "the wider head exists and was initialised rather than left empty"
+    );
+    // The counters came back with it, because they describe the game.
+    assert_eq!(wider.total_steps, saved_step);
+}

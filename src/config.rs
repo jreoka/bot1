@@ -17,7 +17,18 @@ pub const CHECKPOINT_VERSION: u32 = 3;
 /// Bumped whenever the reward function changes meaning.
 pub const REWARD_VERSION: u32 = 3;
 /// Bumped when the model architecture changes in a way that invalidates weights.
-pub const ARCH_NAME: &str = "swiglu-rope-transformer-v1";
+///
+/// v2: the SwiGLU feed-forward became a GELU MLP at 4x the embedding, which
+/// removes a projection and changes the tensor names. A v1 checkpoint is
+/// refused rather than half-loaded, because its `ffn.gate` has no home.
+pub const ARCH_NAME: &str = "gelu-rope-transformer-v2";
+
+/// How wide the feed-forward's hidden layer is, as a multiple of the embedding.
+///
+/// The standard transformer ratio: the block spends two thirds of its
+/// parameters here, so this is the knob that decides what the model can
+/// represent at all.
+pub const FFN_EXPANSION: usize = 4;
 
 /// How hard the bot may fight for the foreground window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +86,11 @@ pub struct Config {
     pub patch_size: usize,
     pub patch_width: usize,
     pub transformer_layers: usize,
+    /// Hidden width of each block's feed-forward.
+    ///
+    /// `0` means "follow the embedding": [`Config::ffn_width`] returns
+    /// `FFN_EXPANSION * embed_dim`, so the ratio stays 4x when `--embed-dim`
+    /// changes and only an explicit `--ffn-hidden` overrides it.
     pub ffn_hidden: usize,
     pub attention_heads: usize,
     pub attention_dropout: f32,
@@ -169,6 +185,12 @@ pub struct Config {
     // =====================================================================
     // Checkpointing
     // =====================================================================
+    /// Where each game's training directory lives: `<runs_dir>/<game>/`.
+    ///
+    /// Per game because a policy trained on one game must never be resumed
+    /// into another; `--checkpoint-dir` still names one directory outright for
+    /// scripts that want that.
+    pub runs_dir: String,
     pub checkpoint_dir: String,
     pub checkpoint_interval_sec: f32,
     pub checkpoint_keep: usize,
@@ -231,7 +253,7 @@ impl Default for Config {
             patch_size: 16,
             patch_width: 64,
             transformer_layers: 2,
-            ffn_hidden: 192,
+            ffn_hidden: 0,
             attention_heads: 4,
             attention_dropout: 0.0,
             seq_len: 16,
@@ -295,6 +317,7 @@ impl Default for Config {
             calibrate_key: "f8".to_string(),
             calibrate_min_hold: 0.12,
 
+            runs_dir: "runs".to_string(),
             checkpoint_dir: "checkpoints".to_string(),
             checkpoint_interval_sec: 300.0,
             checkpoint_keep: 3,
@@ -319,6 +342,15 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The feed-forward's hidden width, resolving `0` to `4 * embed_dim`.
+    pub fn ffn_width(&self) -> usize {
+        if self.ffn_hidden == 0 {
+            FFN_EXPANSION * self.embed_dim
+        } else {
+            self.ffn_hidden
+        }
+    }
+
     /// Input channels the model sees: the grey stack plus one difference.
     pub fn channels(&self) -> usize {
         self.frame_stack + 1
@@ -367,8 +399,11 @@ impl Config {
             "transformer_layers must be at least 1"
         );
         anyhow::ensure!(
-            self.ffn_hidden >= self.embed_dim,
-            "ffn_hidden must be at least embed_dim"
+            self.ffn_hidden == 0 || self.ffn_hidden >= self.embed_dim,
+            "ffn_hidden must be 0 (meaning {}x embed_dim = {}) or at least embed_dim {}",
+            FFN_EXPANSION,
+            FFN_EXPANSION * self.embed_dim,
+            self.embed_dim
         );
         anyhow::ensure!(self.attention_heads >= 1, "attention_heads must be at least 1");
         anyhow::ensure!(
@@ -514,6 +549,7 @@ impl Config {
 
         env_string!(keymap_path);
         env_string!(calibrate_key);
+        env_string!(runs_dir);
         env_string!(checkpoint_dir);
         env_string!(final_model_path);
         env_string!(hotkey_pause);
@@ -557,8 +593,8 @@ impl Config {
             self.mouse_turn_start
         };
         format!(
-            "obs {}x{}x{} grey (+diff), repeat {}, swiglu+rope transformer {}d x {}L \
-             x {}H (ffn {}, window {} frames, {} patch token(s)/frame), turn speed \
+            "obs {}x{}x{} grey (+diff), repeat {}, rope transformer {}d x {}L x {}H, \
+             gelu ffn {}x embed ({}), window {} frames, {} patch token(s)/frame, turn speed \
              x[{}] from a {}px base, rollout {} x {} epochs in {}-step minibatches",
             self.frame_stack,
             self.frame_size,
@@ -567,7 +603,8 @@ impl Config {
             self.embed_dim,
             self.transformer_layers,
             self.attention_heads,
-            self.ffn_hidden,
+            self.ffn_width() / self.embed_dim.max(1),
+            self.ffn_width(),
             self.mem_tokens,
             self.frame_tokens(),
             speeds,
