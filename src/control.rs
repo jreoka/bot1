@@ -78,18 +78,29 @@ impl SignalController {
         self.last = Instant::now();
         install_interrupt_handler();
         let Some(hotkeys) = self.hotkeys.as_mut() else {
-            println!("[Hotkeys] No global hotkeys; Ctrl+C still saves and quits.");
+            crate::ui::ui().event_as(
+                "Hotkeys",
+                crate::ui::Tone::Dim,
+                "No global hotkeys; Ctrl+C still saves and quits.",
+            );
             self.maybe_ungate();
             return false;
         };
         let available = hotkeys.start();
         for message in hotkeys.drain_messages() {
-            println!("[Hotkeys] {message}");
+            crate::ui::ui().event("Hotkeys", message);
         }
         if available {
-            println!("[Hotkeys] {} (work from any window)", hotkeys.describe());
+            crate::ui::ui().event(
+                "Hotkeys",
+                format!("{} (work from any window)", hotkeys.describe()),
+            );
         } else {
-            println!("[Hotkeys] No global hotkeys; Ctrl+C still saves and quits.");
+            crate::ui::ui().event_as(
+                "Hotkeys",
+                crate::ui::Tone::Dim,
+                "No global hotkeys; Ctrl+C still saves and quits.",
+            );
         }
         self.maybe_ungate();
         available
@@ -106,7 +117,10 @@ impl SignalController {
         if self.wait_for_start && !some_hotkey {
             self.wait_for_start = false;
             self.start_key_seen = true;
-            println!("[Control] The start key is unavailable, so the run starts immediately.");
+            crate::ui::ui().event(
+                "Control",
+                "The start key is unavailable, so the run starts immediately.",
+            );
         }
     }
 
