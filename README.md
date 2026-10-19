@@ -58,17 +58,31 @@ After that, plain `bot1` is the only command you need.
 
 One screen, redrawn in place while it learns, instead of a wall of `[Tag] text` scrolling past:
 
+`bot1 --demo` on the synthetic corridor, at 100 columns:
+
 ```text
-╭─ Minecraft 26.3 - Singleplayer ────────────────────────────────────────────── RUNNING ─╮
-│ steps     2,228   185.2/s   2% in game   00:12   15 episode(s)   08:47 left            │
-│ reward    +2.2152/step   ▅█▁▃▅▇█▇▆▅▃▄▆█▇▅                                         │
-│ update    loss -0.035   pi -0.000   v 0.026   ent 4.83   kl +0.0162   2.93s            │
-│ rollout   70%  180/256  ██████████████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░ │
-│ actions   no keys+turn 33%   1 key(s)+turn 33%   2 key(s)+turn 13%                     │
-│ learning  3 update(s) applied, 1 in flight                                             │
-╰─ F8 pause   F9 save   F10 quit   Ctrl+C stop ──────────────────────────────────────────╯
+╭─ Synthetic corridor ────────────────────────────────────────────────────────────────── RUNNING ─╮
+│ steps    1,113   185.0/s   2% in game   00:06   8 episode(s)   08:54  ╭─ vision ───────────────╮│
+│ reward   +2.4558/step   ▁                                             │░░                    ░░││
+│ update   loss +0.056   pi -0.000   v 0.205   ent 4.68   kl +0.0002    │░░                    ░░││
+│ rollout  35%  89/256  ████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │░░                    ░░││
+│ actions  no keys+turn 46%   1 key(s)+turn 31%   no keys 9%            │░░                    ░░││
+│ learning 1 update(s) applied, 1 in flight, 2 rollout(s) dropped       │░░                    ░░││
+│                                                                       │░░░░░░░░░░░░░░░░░░░░░░░░││
+│                                                                       │░░░░░░░░░░░░░░░░░░░░░░░░││
+│                                                                       │░░░            ░░    ░░░││
+│                                                                       │░░             ░▒     ░░││
+│                                                                       │░░                    ░░││
+│                                                                       │░░                    ░░││
+│                                                                       │░░                    ░░││
+│                                                                       ╰────────────────────────╯│
+╰─ F8 pause   F9 save   F10 quit   Ctrl+C stop ───────────────────────────────────────────────────╯
 ```
 
+- **It shows you what it sees.** The `vision` box is the newest frame of the observation -
+  the same grey square the model is handed - area-averaged down to one character per pixel.
+  Beside the numbers when the terminal is wide enough, under them when it is not, and gone
+  when there is no room for both.
 - **The header and the numbers move**: steps, decisions per second, episodes, elapsed time,
   and - with `--steps` - how long is left. Nothing is guessed; every number is the one the
   loop is working from.

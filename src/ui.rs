@@ -111,6 +111,8 @@ struct Glyphs {
     bar_empty: &'static str,
     spark: [&'static str; 8],
     bullet: &'static str,
+    /// Dark to bright, one glyph per pixel of the vision view.
+    shade: [&'static str; 5],
 }
 
 const UNICODE: Glyphs = Glyphs {
@@ -126,6 +128,7 @@ const UNICODE: Glyphs = Glyphs {
     bar_empty: "░",
     spark: ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"],
     bullet: "·",
+    shade: [" ", "░", "▒", "▓", "█"],
 };
 
 const ASCII: Glyphs = Glyphs {
@@ -141,6 +144,7 @@ const ASCII: Glyphs = Glyphs {
     bar_empty: ".",
     spark: [".", ":", "-", "=", "+", "*", "#", "@"],
     bullet: "-",
+    shade: [" ", ".", ":", "*", "#"],
 };
 
 // =====================================================================
@@ -343,8 +347,33 @@ pub enum Row {
         points: Vec<f32>,
         tone: Tone,
     },
+    /// A label and a pixelated picture of what the bot is looking at.
+    ///
+    /// `plane` is one grey frame - `height * width` values, row-major, in
+    /// `[0, 1]` (or `[0, 255]`, which the renderer detects the same way the
+    /// fingerprint does). The renderer decides how many rows and columns the
+    /// panel has room for, so the caller passes the frame it has, not a size.
+    View {
+        label: String,
+        plane: Vec<f32>,
+        height: usize,
+        width: usize,
+    },
     /// An empty line, for grouping.
     Blank,
+}
+
+impl Row {
+    /// The label column this row draws with, whatever kind of row it is.
+    fn label(&self) -> &str {
+        match self {
+            Row::Line { label, .. }
+            | Row::Meter { label, .. }
+            | Row::Spark { label, .. }
+            | Row::View { label, .. } => label,
+            Row::Blank => "",
+        }
+    }
 }
 
 /// The panel a run redraws in place: a border, a heading, a badge, rows,
@@ -418,6 +447,23 @@ impl Frame {
 
     pub fn blank(mut self) -> Self {
         self.rows.push(Row::Blank);
+        self
+    }
+
+    /// The bot's own frame, pixelated, as a block inside the panel.
+    pub fn view(
+        mut self,
+        label: impl Into<String>,
+        plane: Vec<f32>,
+        height: usize,
+        width: usize,
+    ) -> Self {
+        self.rows.push(Row::View {
+            label: label.into(),
+            plane,
+            height,
+            width,
+        });
         self
     }
 
@@ -975,10 +1021,8 @@ impl Ui {
             .rows
             .iter()
             .map(|row| match row {
-                Row::Line { label, .. } | Row::Meter { label, .. } | Row::Spark { label, .. } => {
-                    visible_width(label)
-                }
                 Row::Blank => 0,
+                other => visible_width(other.label()),
             })
             .max()
             .unwrap_or(6)
@@ -986,68 +1030,88 @@ impl Ui {
         // One column of air on the right, so nothing is ever drawn against the
         // border: a bar that touches the frame reads as a clipping bug.
         let head_width = 1 + label_width + 1;
+
+        // The picture is one row of the frame that draws as a block: beside the
+        // numbers when there is room for both, under them when there is not. A
+        // panel that is mostly picture is a worse dashboard than one that is
+        // mostly numbers, which is what decides the two.
+        let mut stats: Vec<&Row> = Vec::new();
+        let mut picture: Option<(&str, &[f32], usize, usize)> = None;
         for row in &frame.rows {
-            let content = match row {
-                Row::Blank => " ".repeat(inner),
-                Row::Line { label, value, tone } => {
-                    let head = format!(
-                        " {} ",
-                        self.paint(Tone::Dim, &fit(&format!("{label} "), label_width)),
-                    );
-                    let space = inner.saturating_sub(head_width + 1);
-                    format!("{head}{}", fit(&self.paint(*tone, value), space))
-                }
-                Row::Meter {
+            match row {
+                Row::View {
                     label,
-                    value,
-                    fraction,
-                    tone,
-                } => {
-                    let head = format!(
-                        " {} ",
-                        self.paint(Tone::Dim, &fit(&format!("{label} "), label_width)),
-                    );
-                    let space = inner.saturating_sub(head_width + 1);
-                    let (bar_width, value_text) = if space < visible_width(value) + 12 {
-                        // Too narrow for a bar: the number is the whole row.
-                        (0, fit(&self.paint(*tone, value), space))
-                    } else {
-                        (
-                            space - visible_width(value) - 2,
-                            format!("{} ", self.paint(*tone, value)),
-                        )
-                    };
-                    let used = visible_width(&value_text);
-                    let bar = self.bar(*fraction, bar_width, *tone);
-                    let gap = space.saturating_sub(used + bar_width);
-                    format!("{head}{}{}{bar}", value_text, " ".repeat(gap))
+                    plane,
+                    height,
+                    width,
+                } => picture = Some((label, plane, *height, *width)),
+                other => stats.push(other),
+            }
+        }
+
+        // Beside: the box is at most a quarter of the panel's width, and only
+        // when the numbers still get a sane column of their own.
+        let mut beside: Option<Vec<String>> = None;
+        if let Some((label, plane, source_height, source_width)) = picture {
+            let lines = self.view_box(
+                label,
+                plane,
+                source_height,
+                source_width,
+                inner,
+                height.saturating_sub(4),
+            );
+            if let Some(lines) = lines {
+                let box_width = visible_width(&lines[0]);
+                // The numbers are the point of the panel: the picture only goes
+                // beside them when they still get their own column.
+                if inner >= box_width + 70 {
+                    beside = Some(lines);
                 }
-                Row::Spark {
-                    label,
-                    value,
-                    points,
-                    tone,
-                } => {
-                    let head = format!(
-                        " {} ",
-                        self.paint(Tone::Dim, &fit(&format!("{label} "), label_width)),
-                    );
-                    let space = inner.saturating_sub(head_width + 1);
-                    let value_text = format!("{}   ", self.paint(*tone, value));
-                    let used = visible_width(&value_text);
-                    // The trend sits right after the number it belongs to: a
-                    // sparkline pushed to the far edge reads as unrelated.
-                    let spark_width = space.saturating_sub(used).min(32);
-                    let spark = self.sparkline(points, spark_width, *tone);
-                    let gap = space.saturating_sub(used + spark_width);
-                    format!("{head}{value_text}{spark}{}", " ".repeat(gap))
-                }
+            }
+        }
+
+        let left = match &beside {
+            Some(lines) => inner - visible_width(&lines[0]) - 1,
+            None => inner,
+        };
+        let boxed_lines = beside.as_ref().map(|lines| lines.len()).unwrap_or(0);
+        let lines = stats.len().max(boxed_lines);
+        for index in 0..lines {
+            let content = match stats.get(index) {
+                Some(row) => self.row_content(row, left, label_width, head_width),
+                None => String::new(),
             };
-            out.push_str(&format!(
-                "{}{}{}\n",
+            let mut line = format!(
+                "{}{}",
                 self.paint(Tone::Dim, self.glyphs.vertical),
-                fit(&content, inner),
-                self.paint(Tone::Dim, self.glyphs.vertical),
+                fit(&content, left),
+            );
+            if let Some(boxed) = &beside {
+                line.push(' ');
+                match boxed.get(index) {
+                    Some(right) => line.push_str(right),
+                    None => line.push_str(&" ".repeat(visible_width(&boxed[0]))),
+                }
+            }
+            line.push_str(&self.paint(Tone::Dim, self.glyphs.vertical));
+            out.push_str(&line);
+            out.push('\n');
+        }
+
+        // Under: only when it could not go beside, and only as tall as the rest
+        // of the panel leaves room for.
+        if beside.is_none()
+            && let Some((label, plane, source_height, source_width)) = picture
+        {
+            out.push_str(&self.view_block(
+                label,
+                plane,
+                source_height,
+                source_width,
+                label_width,
+                inner,
+                height.saturating_sub(stats.len() + 4),
             ));
         }
 
@@ -1150,6 +1214,226 @@ impl Ui {
         self.paint(tone, &rendered)
     }
 
+    /// The content of one row, at a given width. `fit` finishes the job.
+    fn row_content(&self, row: &Row, inner: usize, label_width: usize, head_width: usize) -> String {
+        let head = format!(
+            " {} ",
+            self.paint(Tone::Dim, &fit(&format!("{} ", row.label()), label_width)),
+        );
+        match row {
+            Row::Blank => " ".repeat(inner),
+            // A view is drawn by `view_box` or `view_block`, never as one row.
+            Row::View { .. } => String::new(),
+            Row::Line { value, tone, .. } => {
+                let space = inner.saturating_sub(head_width + 1);
+                format!("{head}{}", fit(&self.paint(*tone, value), space))
+            }
+            Row::Meter {
+                value,
+                fraction,
+                tone,
+                ..
+            } => {
+                let space = inner.saturating_sub(head_width + 1);
+                let (bar_width, value_text) = if space < visible_width(value) + 12 {
+                    // Too narrow for a bar: the number is the whole row.
+                    (0, fit(&self.paint(*tone, value), space))
+                } else {
+                    (
+                        space - visible_width(value) - 2,
+                        format!("{} ", self.paint(*tone, value)),
+                    )
+                };
+                let used = visible_width(&value_text);
+                let bar = self.bar(*fraction, bar_width, *tone);
+                let gap = space.saturating_sub(used + bar_width);
+                format!("{head}{value_text}{}{bar}", " ".repeat(gap))
+            }
+            Row::Spark {
+                value, points, tone, ..
+            } => {
+                let space = inner.saturating_sub(head_width + 1);
+                let value_text = format!("{}   ", self.paint(*tone, value));
+                let used = visible_width(&value_text);
+                // The trend sits right after the number it belongs to: a
+                // sparkline pushed to the far edge reads as unrelated.
+                let spark_width = space.saturating_sub(used).min(32);
+                let spark = self.sparkline(points, spark_width, *tone);
+                let gap = space.saturating_sub(used + spark_width);
+                format!("{head}{value_text}{spark}{}", " ".repeat(gap))
+            }
+        }
+    }
+
+    /// One grey frame at `rows` x `columns`, one character per pixel.
+    ///
+    /// `None` rather than a panic for a frame that is not the shape it claims
+    /// to be: a run does not stop learning because the picture is malformed.
+    fn pixel_rows(
+        &self,
+        plane: &[f32],
+        source_height: usize,
+        source_width: usize,
+        rows: usize,
+        columns: usize,
+    ) -> Option<Vec<String>> {
+        if source_width == 0
+            || source_height == 0
+            || rows == 0
+            || columns == 0
+            || plane.len() < source_width * source_height
+        {
+            return None;
+        }
+        // The same range detection the fingerprint does: a frame is normally in
+        // `[0, 1]`, and a frame in 0..255 must not draw as a white block.
+        let peak = plane
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(0.0f32, f32::max);
+        let scale = if peak > 1.5 { 1.0 / 255.0 } else { 1.0 };
+        let sample = crate::vision::area_resize(plane, source_height, source_width, rows, columns);
+        let ramp = self.glyphs.shade;
+        let mut lines = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let mut line = String::with_capacity(columns);
+            for column in 0..columns {
+                let value = (sample[row * columns + column] * scale).clamp(0.0, 1.0);
+                let index = (value * (ramp.len() - 1) as f32).round() as usize;
+                line.push_str(ramp[index.min(ramp.len() - 1)]);
+            }
+            lines.push(line);
+        }
+        Some(lines)
+    }
+
+    /// The widest the picture beside the numbers is drawn, in pixels.
+    ///
+    /// The observation is square and a character cell is about twice as tall as
+    /// it is wide, so half as many rows as columns is the shape the bot sees.
+    const VIEW_COLUMNS: usize = 32;
+
+    /// The picture as its own little bordered box: `╭─ vision ──╮` and so on.
+    ///
+    /// Each line is exactly `columns + 2` wide. `None` when the panel is too
+    /// small for a picture worth drawing.
+    fn view_box(
+        &self,
+        label: &str,
+        plane: &[f32],
+        source_height: usize,
+        source_width: usize,
+        inner: usize,
+        room: usize,
+    ) -> Option<Vec<String>> {
+        let mut columns = Self::VIEW_COLUMNS.min(inner / 4).max(16);
+        let mut rows = (columns / 2).max(1);
+        if rows + 2 > room {
+            rows = room.saturating_sub(2);
+            columns = rows * 2;
+        }
+        if rows < 5 || columns < 16 {
+            return None;
+        }
+        let pixels = self.pixel_rows(plane, source_height, source_width, rows, columns)?;
+        let mut lines: Vec<String> = Vec::with_capacity(rows + 2);
+        lines.push(
+            self.border(
+                self.glyphs.top_left,
+                self.glyphs.top_right,
+                &self.paint(Tone::Dim, label),
+                "",
+                columns,
+            )
+            .trim_end_matches('\n')
+            .to_string(),
+        );
+        for row in pixels {
+            lines.push(format!(
+                "{}{}{}",
+                self.paint(Tone::Dim, self.glyphs.vertical),
+                row,
+                self.paint(Tone::Dim, self.glyphs.vertical),
+            ));
+        }
+        lines.push(
+            self.border(
+                self.glyphs.bottom_left,
+                self.glyphs.bottom_right,
+                "",
+                "",
+                columns,
+            )
+            .trim_end_matches('\n')
+            .to_string(),
+        );
+        Some(lines)
+    }
+
+    /// The widest the picture under the numbers is drawn, in pixels.
+    ///
+    /// Narrower than the box beside them: a panel stacked like that is already
+    /// as tall as the terminal can take, and the numbers come first.
+    const VIEW_BELOW_COLUMNS: usize = 24;
+
+    /// The picture as a block under the numbers, on a terminal too narrow to
+    /// put it beside them: a labelled block, `inner` columns wide, `room` rows.
+    fn view_block(
+        &self,
+        label: &str,
+        plane: &[f32],
+        source_height: usize,
+        source_width: usize,
+        label_width: usize,
+        inner: usize,
+        room: usize,
+    ) -> String {
+        let head_width = 1 + label_width + 1;
+        let space = inner.saturating_sub(head_width + 1);
+        let mut columns = space.min(Self::VIEW_BELOW_COLUMNS);
+        // Half as many rows as columns, so a square frame stays square; when
+        // the panel has less room than that, the picture narrows instead of
+        // stretching.
+        let mut rows = (columns / 2).max(1);
+        if rows > room {
+            rows = room;
+            columns = (rows * 2).min(space);
+        }
+        // A view too small to read is worse than no view.
+        if columns < 12 || rows < 4 {
+            return String::new();
+        }
+        let Some(pixels) = self.pixel_rows(plane, source_height, source_width, rows, columns) else {
+            return String::new();
+        };
+        // Centred in the space the numbers do not use: a block pinned to the
+        // left of a wide empty row reads as a column of the panel, not a picture.
+        let extra = inner.saturating_sub(head_width + columns + 1);
+        let (left_air, right_air) = (extra / 2, extra - extra / 2);
+        let mut out = String::with_capacity(rows * (inner + 16));
+        for (index, row) in pixels.iter().enumerate() {
+            let mut line = if index == 0 {
+                format!(
+                    " {} ",
+                    self.paint(Tone::Dim, &fit(&format!("{label} "), label_width))
+                )
+            } else {
+                " ".repeat(head_width)
+            };
+            line.push_str(&" ".repeat(left_air));
+            line.push_str(row);
+            line.push_str(&" ".repeat(right_air));
+            out.push_str(&format!(
+                "{}{}{}\n",
+                self.paint(Tone::Dim, self.glyphs.vertical),
+                fit(&line, inner),
+                self.paint(Tone::Dim, self.glyphs.vertical),
+            ));
+        }
+        out
+    }
+
     /// Too narrow or too short for a border: one dense line.
     fn compose_compact(&self, frame: &Frame, width: usize) -> String {
         let mut parts: Vec<String> = Vec::new();
@@ -1159,6 +1443,9 @@ impl Ui {
         for row in &frame.rows {
             match row {
                 Row::Blank => {}
+                // One line is all a compact panel has; the picture is the
+                // first thing to go.
+                Row::View { .. } => {}
                 Row::Line { label, value, tone } | Row::Meter { label, value, tone, .. } => {
                     parts.push(format!(
                         "{} {}",
@@ -1291,6 +1578,47 @@ fn terminal_size() -> Option<(usize, usize)> {
 // A cheap, fake-data preview so the panel can be seen without a game
 // =====================================================================
 
+/// A plausible thing to look at, for `--ui-preview`.
+///
+/// A horizon, a row of blocks drifting past, a character, and the falloff of a
+/// light: enough structure that the pixel view reads as a game rather than as
+/// noise, and it moves, so the preview shows a picture that changes the way a
+/// real run's does.
+fn preview_scene(tick: usize, size: usize) -> Vec<f32> {
+    let mut plane = vec![0.0f32; size * size];
+    let body = (size / 12).max(2) as i32;
+    let walker = size as i32 / 2 + ((tick as f32 * 0.35).sin() * size as f32 * 0.2) as i32;
+    let horizon = size * 44 / 100;
+    for y in 0..size {
+        for x in 0..size {
+            let fx = x as f32 / size as f32;
+            let fy = y as f32 / size as f32;
+            let mut value = if y < horizon {
+                0.18 + fy * 1.2
+            } else {
+                0.30 - (fy - 0.44) * 0.35
+            };
+            // Blocks on the ground line, scrolling left.
+            if y >= horizon && y < horizon + size / 12 && (x / 7 + tick / 6) % 5 == 0 {
+                value += 0.22;
+            }
+            // A floor seam every so often, so the ground has depth.
+            if y >= horizon && (y - horizon) % (size / 8).max(2) == 0 {
+                value -= 0.10;
+            }
+            // The character.
+            let dx = x as i32 - walker;
+            let dy = y as i32 - (horizon as i32 - body);
+            if dx.abs() < body && (0..body * 2).contains(&dy) {
+                value = 0.92;
+            }
+            let glow = ((fx - 0.5).powi(2) + (fy - 0.55).powi(2)).sqrt();
+            plane[y * size + x] = (value * (1.15 - glow).clamp(0.30, 1.0)).clamp(0.0, 1.0);
+        }
+    }
+    plane
+}
+
 /// Frames of a plausible run, for `--ui-preview`.
 pub fn preview_frames() -> Vec<Frame> {
     let mut frames = Vec::new();
@@ -1346,6 +1674,7 @@ pub fn preview_frames() -> Vec<Frame> {
                     "W 42%   S 11%   A 9%   D 8%      W/A/S/D held 78% of steps",
                     Tone::Body,
                 )
+                .view("vision", preview_scene(tick, 64), 64, 64)
                 .footer("F8 pause   F9 save   F10 quit   Ctrl+C stop"),
         );
     }
@@ -1460,6 +1789,70 @@ mod tests {
         let composed = ui.compose(&frame);
         assert_eq!(composed.lines().count(), 1, "{composed}");
         assert!(visible_width(composed.trim_end()) <= 29);
+    }
+
+    /// A frame with a picture in it, for the layout tests below.
+    fn frame_with_view(plane: Vec<f32>) -> Frame {
+        Frame::new("Synthetic corridor")
+            .badge("RUNNING", Tone::Good)
+            .line("steps", "1008   167.3/s   3% in game   7 episode(s)", Tone::Value)
+            .spark("reward", "+2.1051/step", vec![1.0, 2.0, 3.0], Tone::Good)
+            .meter("rollout", "94%  240/256", 0.94, Tone::Accent)
+            .line("actions", "no keys+turn 45%   1 key(s)+turn 32%", Tone::Body)
+            .view("vision", plane, 64, 64)
+            .footer("F8 pause   F9 save   F10 quit")
+    }
+
+    #[test]
+    fn the_vision_box_keeps_every_line_of_the_panel_the_same_width() {
+        unsafe { std::env::set_var("COLUMNS", "80") };
+        let ui = Ui::fixed(true, true, true);
+        ui.width.store(80, Ordering::Relaxed);
+        ui.height.store(40, Ordering::Relaxed);
+        let plane: Vec<f32> = (0..64 * 64).map(|index| (index % 64) as f32 / 63.0).collect();
+        let composed = ui.compose(&frame_with_view(plane));
+        let widths: Vec<usize> = composed.lines().map(visible_width).collect();
+        assert!(
+            widths.iter().all(|width| *width == 79),
+            "widths {widths:?}\n{composed}"
+        );
+        assert!(composed.contains("vision"), "{composed}");
+        // The picture is beside the numbers, so the panel is barely taller than
+        // the rows it would draw without one.
+        assert!(composed.lines().count() <= 20, "{composed}");
+    }
+
+    #[test]
+    fn a_panel_with_no_room_for_the_picture_still_fits_the_terminal() {
+        unsafe { std::env::set_var("COLUMNS", "80") };
+        let ui = Ui::fixed(true, true, true);
+        ui.width.store(80, Ordering::Relaxed);
+        ui.height.store(12, Ordering::Relaxed);
+        let plane = vec![1.0f32; 64 * 64];
+        let composed = ui.compose(&frame_with_view(plane));
+        let widths: Vec<usize> = composed.lines().map(visible_width).collect();
+        assert!(widths.iter().all(|width| *width == 79), "{composed}");
+        // The panel never draws more lines than the terminal has: a taller
+        // panel scrolls, and scrolling breaks the erase-by-count redraw.
+        assert!(composed.lines().count() < 12, "{composed}");
+    }
+
+    #[test]
+    fn a_malformed_frame_draws_no_picture_and_does_not_panic() {
+        let ui = Ui::fixed(false, true, true);
+        assert!(ui.pixel_rows(&[0.5; 4], 8, 8, 4, 8).is_none());
+        assert!(ui.pixel_rows(&[], 0, 0, 4, 8).is_none());
+    }
+
+    #[test]
+    fn the_picture_maps_dark_to_shade_and_bright_to_solid() {
+        let ui = Ui::fixed(false, true, false);
+        // Two pixels: black and white, sampled to the same two columns.
+        let rows = ui.pixel_rows(&[0.0, 1.0, 0.0, 1.0], 2, 2, 1, 2).unwrap();
+        assert_eq!(rows, vec![" █".to_string()]);
+        // A frame in 0..255 is read the same way a frame in 0..1 is.
+        let wide = ui.pixel_rows(&[0.0, 255.0, 0.0, 255.0], 2, 2, 1, 2).unwrap();
+        assert_eq!(wide, vec![" █".to_string()]);
     }
 
     #[test]

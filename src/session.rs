@@ -2056,6 +2056,28 @@ impl<B: AutodiffBackend> GameSession<B> {
                 Tone::Dim,
             );
         }
+
+        // What the bot is looking at right now: the newest grey frame of the
+        // observation - not the motion channel, which is a difference and looks
+        // like noise on screen. Nothing to show before the first capture, and
+        // the renderer drops the block on a terminal too short for it.
+        let gray = self.env.gray_channels().max(1);
+        let newest = gray.saturating_sub(1);
+        if newest < self.observation.channels
+            && self.observation.width > 0
+            && self.observation.height > 0
+        {
+            let plane = self.observation.channel(newest);
+            if plane.iter().any(|value| *value > 0.0) {
+                frame = frame.view(
+                    "vision",
+                    plane.to_vec(),
+                    self.observation.height,
+                    self.observation.width,
+                );
+            }
+        }
+
         frame.footer(if self.paused {
             "F8 resume   F9 save   F10 quit   Ctrl+C stop - nothing is being sent"
         } else {
