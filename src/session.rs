@@ -102,6 +102,17 @@ pub trait Environment {
     fn current_observation(&mut self) -> Option<Observation> {
         None
     }
+
+    /// A small colour picture of what the bot is looking at right now.
+    ///
+    /// Decoration for the live panel, never input: the model is handed grey
+    /// channels and has to keep being handed them, but a person reading the panel
+    /// tells a corridor, a health bar and a hazard apart by hue long before
+    /// brightness. `None` - or an empty picture - means the panel draws the newest
+    /// grey channel of the observation instead.
+    fn picture(&self) -> Option<crate::vision::Picture> {
+        None
+    }
 }
 
 /// Tracks the slow-moving quantities that reveal a run going wrong.
@@ -2061,20 +2072,25 @@ impl<B: AutodiffBackend> GameSession<B> {
         // observation - not the motion channel, which is a difference and looks
         // like noise on screen. Nothing to show before the first capture, and
         // the renderer drops the block on a terminal too short for it.
-        let gray = self.env.gray_channels().max(1);
-        let newest = gray.saturating_sub(1);
-        if newest < self.observation.channels
-            && self.observation.width > 0
-            && self.observation.height > 0
-        {
-            let plane = self.observation.channel(newest);
-            if plane.iter().any(|value| *value > 0.0) {
-                frame = frame.view(
-                    "vision",
-                    plane.to_vec(),
-                    self.observation.height,
-                    self.observation.width,
-                );
+        match self.env.picture() {
+            Some(picture) if !picture.is_empty() => frame = frame.picture("vision", picture),
+            _ => {
+                let gray = self.env.gray_channels().max(1);
+                let newest = gray.saturating_sub(1);
+                if newest < self.observation.channels
+                    && self.observation.width > 0
+                    && self.observation.height > 0
+                {
+                    let plane = self.observation.channel(newest);
+                    if plane.iter().any(|value| *value > 0.0) {
+                        frame = frame.view(
+                            "vision",
+                            plane.to_vec(),
+                            self.observation.height,
+                            self.observation.width,
+                        );
+                    }
+                }
             }
         }
 

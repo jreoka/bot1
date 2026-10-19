@@ -9,7 +9,14 @@
 
 use std::time::{Duration, Instant};
 
-use crate::vision::Observation;
+use crate::vision::{Observation, Picture};
+
+/// Columns of the colour thumbnail the dashboard draws.
+///
+/// The panel's picture box is at most 32 columns wide, so there is nothing to gain
+/// from keeping more; the thumbnail is square like the observation, and the
+/// renderer shrinks it to the rows the panel has room for.
+pub const PREVIEW_SIZE: usize = 32;
 
 /// One grabbed frame, as the platform handed it over.
 ///
@@ -54,6 +61,8 @@ pub struct FrameStack {
     pub stack: usize,
     /// Grey frames plus the motion channel: what the model's input width is.
     pub channels: usize,
+    /// A colour thumbnail of the newest frame, for the dashboard only.
+    preview: Picture,
     /// The ring of grey frames, oldest first after the first `filled` entries.
     buffer: Vec<u8>,
     filled: usize,
@@ -72,6 +81,7 @@ impl FrameStack {
             size,
             stack,
             channels: stack + 1,
+            preview: Picture::default(),
             buffer: vec![0; stack * size * size],
             filled: 0,
             out: Observation::zeros(stack + 1, size, size),
@@ -83,7 +93,17 @@ impl FrameStack {
 
     pub fn clear(&mut self) {
         self.buffer.fill(0);
+        self.preview = Picture::default();
         self.filled = 0;
+    }
+
+    /// A colour thumbnail of the newest frame, for the panel's picture box.
+    ///
+    /// The dashboard reads it; the model never does. Empty until a frame has been
+    /// pushed, which is what makes "nothing to show yet" a state the panel can
+    /// render rather than a black square it has to explain.
+    pub fn preview(&self) -> &Picture {
+        &self.preview
     }
 
     /// How many frames have been pushed since the last clear, capped at `stack`.
@@ -132,6 +152,16 @@ impl FrameStack {
         let mut gray = vec![0u8; plane];
         self.gray_into(frame, &mut gray);
         self.buffer[(self.stack - 1) * plane..self.stack * plane].copy_from_slice(&gray);
+        // The same frame, small and in colour, for the panel only. One sequential
+        // pass over the grab: the picture is worth a millisecond, and the model
+        // never sees it.
+        self.preview = Picture::from_bgra(
+            &frame.bgra,
+            frame.width,
+            frame.height,
+            PREVIEW_SIZE,
+            PREVIEW_SIZE,
+        );
         self.filled = (self.filled + 1).min(self.stack);
         self.observe()
     }
@@ -278,6 +308,25 @@ mod tests {
         let observation = stack.push(&solid(64, 64, 128));
         assert_eq!(observation.shape(), (5, 8, 8));
         assert!(observation.data.iter().all(|value| *value >= 0.0 && *value <= 1.0));
+    }
+
+    #[test]
+    fn the_colour_preview_is_the_newest_frame_and_is_empty_before_one() {
+        let mut stack = FrameStack::new(8, 2);
+        assert!(stack.preview().is_empty());
+        // A green frame, then a black one: the preview must be the newest frame,
+        // because the panel is showing what the bot is looking at now.
+        let mut green = vec![0u8; 64 * 64 * 4];
+        for pixel in green.chunks_exact_mut(4) {
+            pixel[1] = 255;
+            pixel[3] = 255;
+        }
+        stack.push(&Frame::new(64, 64, green));
+        let greenness = stack.preview().pixel(0, 0);
+        assert!(greenness[1] > 0.9 && greenness[0] < 0.1, "{greenness:?}");
+        stack.push(&solid(64, 64, 0));
+        assert!(stack.preview().is_empty() || stack.preview().pixel(0, 0) == [0.0, 0.0, 0.0]);
+        assert_eq!(stack.preview().width, PREVIEW_SIZE);
     }
 
     #[test]

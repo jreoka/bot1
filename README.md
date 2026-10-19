@@ -83,11 +83,14 @@ a panel that repaints in place underneath it, instead of a wall of `[Tag] text` 
 ╰─ F8 pause   F9 save   F10 quit   Ctrl+C stop ───────────────────────────────────────────────────╯
 ```
 
-- **It shows you what it sees.** The `vision` box is the newest frame of the observation -
-  the same grey square the model is handed - area-averaged down to one character per pixel.
-  Beside the numbers, shrunk to whatever width they do not need - a value that had to be cut
-  ends in `...` rather than stopping mid-word - and under them only on a terminal too narrow
-  to put both side by side.
+- **It shows you what it sees, in colour.** The `vision` box is the newest captured frame,
+  area-averaged down to one character per pixel: the glyph is how lit the pixel is, the colour
+  is what colour it is. The *model* still gets grey - it was trained on luminance and has to
+  keep being handed it - so the colour is for the person reading the panel, kept as a separate
+  32x32 thumbnail of the same grab. `COLORTERM=truecolor` gets 24-bit; a `256color` terminal
+  gets the xterm cube; anything else falls back to the shade ramp. Beside the numbers, shrunk
+  to whatever width they do not need - a value that had to be cut ends in `...` rather than
+  stopping mid-word - and under them only on a terminal too narrow to put both side by side.
 - **The header and the numbers move**: steps, decisions per second, episodes, elapsed time,
   and - with `--steps` - how long is left. Nothing is guessed; every number is the one the
   loop is working from.

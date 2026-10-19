@@ -27,7 +27,7 @@ use crate::config::Config;
 use crate::keys::{ActionSpace, Keymap};
 use crate::model::{Action, ActorCritic};
 use crate::session::{EnvAction, EnvStep, Environment, GameSession};
-use crate::vision::Observation;
+use crate::vision::{Observation, Picture};
 
 /// A corridor the bot must learn to walk down.
 pub struct SyntheticEnv {
@@ -121,6 +121,114 @@ impl SyntheticEnv {
         frame
     }
 
+    /// The same corridor, in colour, for the panel only.
+    ///
+    /// A separate drawing rather than a tinted `gray_view`: the observation is what
+    /// the model learns from, and its values must not move because the dashboard
+    /// got prettier. The shapes are the same ones - horizon band, converging walls,
+    /// facing marker - so the two pictures agree on what is there, and each part
+    /// gets the colour a corridor would have: cold air above, lit stone ahead,
+    /// warm walls either side, a green marker.
+    fn colour_view(&self) -> Picture {
+        let size = self.cfg.frame_size;
+        let remaining = (self.length - self.cell) as f32;
+        let horizon = (size as f32 * 0.45) as usize;
+        let band = ((size as f32 * 0.18) as usize).max(2);
+        let brightness = 0.25 + 0.6 / (1.0 + remaining / 3.0);
+        // Cold air, and a lit wall at the end of the corridor: the far wall is
+        // warm stone and gets brighter as the bot walks into it.
+        let air = [0.10, 0.13, 0.24];
+        let far_wall = [
+            (0.85 * brightness).clamp(0.0, 1.0),
+            (0.70 * brightness).clamp(0.0, 1.0),
+            (0.46 * brightness).clamp(0.0, 1.0),
+        ];
+        let stone = [0.62, 0.51, 0.36];
+        let mut rgb = Vec::with_capacity(size * size * 3);
+        for row in 0..size {
+            for column in 0..size {
+                // Cold air above the horizon, a stone floor below it, and the lit
+                // far wall on the horizon itself: three surfaces, three colours.
+                let mut colour = if row < horizon {
+                    let depth = row as f32 / horizon.max(1) as f32;
+                    [
+                        air[0] + 0.04 * depth,
+                        air[1] + 0.05 * depth,
+                        air[2] + 0.08 * depth,
+                    ]
+                } else if row < horizon + band {
+                    far_wall
+                } else {
+                    // The floor, in the slate the corridor is paved with: darker
+                    // into the distance, which is what makes it read as a floor.
+                    let near = (row - horizon - band) as f32 / (size - horizon).max(1) as f32;
+                    [
+                        0.40 - 0.16 * near,
+                        0.37 - 0.15 * near,
+                        0.33 - 0.14 * near,
+                    ]
+                };
+                let centre = size / 2;
+                let spread =
+                    ((size as f32 * 0.42 * (remaining / 6.0 + 0.15).min(1.0)) as usize).max(2);
+                let left_start = centre.saturating_sub(spread + 6);
+                let left_end = centre.saturating_sub(spread);
+                let right_start = (centre + spread).min(size);
+                let right_end = (centre + spread + 6).min(size);
+                if (left_start..left_end).contains(&column)
+                    || (right_start..right_end).contains(&column)
+                {
+                    // Walls are brighter the closer they are to the viewer.
+                    let near = (row as f32 / size as f32).clamp(0.0, 1.0);
+                    colour = [
+                        stone[0] * (0.55 + 0.55 * near),
+                        stone[1] * (0.55 + 0.55 * near),
+                        stone[2] * (0.55 + 0.55 * near),
+                    ];
+                }
+                let marker_x =
+                    (centre as i32 + self.facing * (size as f32 * 0.18) as i32).max(0) as usize;
+                let marker_y = horizon + band + 2;
+                if (marker_y..(marker_y + 4).min(size)).contains(&row)
+                    && (marker_x.saturating_sub(2)..(marker_x + 2).min(size)).contains(&column)
+                {
+                    colour = [0.30, 0.95, 0.35];
+                }
+                rgb.push(colour[0]);
+                rgb.push(colour[1]);
+                rgb.push(colour[2]);
+            }
+        }
+        // Walking further in changes the picture even at a distance, exactly as it
+        // does in the observation the model sees.
+        let factor = 1.0 + 0.03 * self.cell as f32;
+        for row in horizon..(horizon + band).min(size) {
+            for column in 0..size {
+                let index = (row * size + column) * 3;
+                for channel in 0..3 {
+                    rgb[index + channel] = (rgb[index + channel] * factor).clamp(0.0, 1.0);
+                }
+            }
+        }
+        Picture::new(size, size, rgb)
+    }
+
+    /// The death screen, in red, so a reset is visible in the panel.
+    fn death_picture(&self) -> Picture {
+        let size = self.cfg.frame_size;
+        let band = (size / 8).max(2);
+        let mut rgb = vec![0.06f32; size * size * 3];
+        for row in (0..size).step_by(band) {
+            for column in 0..size {
+                let index = (row * size + column) * 3;
+                rgb[index] = 0.85;
+                rgb[index + 1] = 0.12;
+                rgb[index + 2] = 0.10;
+            }
+        }
+        Picture::new(size, size, rgb)
+    }
+
     /// A distinct screen the reset detector can see as "something changed".
     fn death_view(&self) -> Vec<f32> {
         let size = self.cfg.frame_size;
@@ -189,6 +297,14 @@ impl Environment for SyntheticEnv {
 
     fn gray_channels(&self) -> usize {
         self.cfg.frame_stack
+    }
+
+    fn picture(&self) -> Option<Picture> {
+        Some(if self.cell < 0 {
+            self.death_picture()
+        } else {
+            self.colour_view()
+        })
     }
 
     fn reset(&mut self, _seed: Option<u64>) -> (Observation, Vec<f32>) {

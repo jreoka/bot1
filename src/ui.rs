@@ -35,6 +35,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::vision::Picture;
+
 // =====================================================================
 // Colour
 // =====================================================================
@@ -74,6 +76,60 @@ impl Tone {
             Tone::Value => "\x1b[97;1m",
             Tone::Body => "\x1b[0m",
         }
+    }
+}
+
+/// How a picture's pixels can be coloured.
+///
+/// A capability, not a preference: it is decided once from the environment, and
+/// the picture is drawn through the shade ramp either way - the colour is what
+/// makes a corridor readable at 32 columns, not what makes it visible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PixelColour {
+    /// 24-bit foreground (`38;2;r;g;b`).
+    True,
+    /// The xterm 256-colour cube (`38;5;n`).
+    Palette,
+    /// No colour: the shade ramp is the whole picture.
+    Off,
+}
+
+/// The nearest xterm-256 colour to an RGB triple.
+///
+/// The cube is 6x6x6 levels of 0, 95, 135, 175, 215, 255, which is not a linear
+/// ramp - so the nearest level is found by looking at the actual values rather
+/// than dividing by 51.
+fn ansi256(red: u8, green: u8, blue: u8) -> u8 {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let nearest = |value: u8| {
+        let mut best = 0usize;
+        for (index, level) in LEVELS.iter().enumerate() {
+            if value.abs_diff(*level) < value.abs_diff(LEVELS[best]) {
+                best = index;
+            }
+        }
+        best as usize
+    };
+    let (r, g, b) = (nearest(red), nearest(green), nearest(blue));
+    let cube = 16 + 36 * r as u8 + 6 * g as u8 + b as u8;
+    let distance = |colour: (i32, i32, i32)| {
+        let (cr, cg, cb) = colour;
+        3 * (cr - red as i32).pow(2) + 5 * (cg - green as i32).pow(2) + 2 * (cb - blue as i32).pow(2)
+    };
+    let cube_distance = distance((
+        LEVELS[r] as i32,
+        LEVELS[g] as i32,
+        LEVELS[b] as i32,
+    ));
+    // The 24-step grey ramp (232..255) is finer than the cube for greys, and most
+    // of a game's picture is grey-ish, so it is worth looking at both.
+    let average = (red as i32 + green as i32 + blue as i32) / 3;
+    let grey_index = ((average - 8 + 5) / 10).clamp(0, 23);
+    let grey = (8 + 10 * grey_index) as u8;
+    if distance((grey as i32, grey as i32, grey as i32)) < cube_distance {
+        232 + grey_index as u8
+    } else {
+        cube
     }
 }
 
@@ -355,15 +411,13 @@ pub enum Row {
     },
     /// A label and a pixelated picture of what the bot is looking at.
     ///
-    /// `plane` is one grey frame - `height * width` values, row-major, in
-    /// `[0, 1]` (or `[0, 255]`, which the renderer detects the same way the
-    /// fingerprint does). The renderer decides how many rows and columns the
-    /// panel has room for, so the caller passes the frame it has, not a size.
+    /// `picture` is one small RGB frame - `1 / 0` or `[0, 1]`, the renderer
+    /// detects the range the same way the fingerprint does. The renderer decides
+    /// how many rows and columns the panel has room for, so the caller passes the
+    /// frame it has, not a size.
     View {
         label: String,
-        plane: Vec<f32>,
-        height: usize,
-        width: usize,
+        picture: Picture,
     },
     /// An empty line, for grouping.
     Blank,
@@ -468,7 +522,10 @@ impl Frame {
         self
     }
 
-    /// The bot's own frame, pixelated, as a block inside the panel.
+    /// One grey frame, pixelated, as a block inside the panel.
+    ///
+    /// The panel draws it in colour when the terminal and the renderer can: three
+    /// equal channels are grey, so this is the same picture either way.
     pub fn view(
         mut self,
         label: impl Into<String>,
@@ -478,9 +535,16 @@ impl Frame {
     ) -> Self {
         self.rows.push(Row::View {
             label: label.into(),
-            plane,
-            height,
-            width,
+            picture: Picture::from_grey(&plane, height, width),
+        });
+        self
+    }
+
+    /// The bot's own frame, in colour, as a block inside the panel.
+    pub fn picture(mut self, label: impl Into<String>, picture: Picture) -> Self {
+        self.rows.push(Row::View {
+            label: label.into(),
+            picture,
         });
         self
     }
@@ -511,6 +575,8 @@ pub struct Ui {
     glyphs: Glyphs,
     /// stdout is a terminal, so a redrawn panel is meaningful at all.
     interactive: bool,
+    /// How the panel's picture may be coloured.
+    pixels: PixelColour,
     width: AtomicUsize,
     height: AtomicUsize,
     live: Mutex<LiveState>,
@@ -581,6 +647,28 @@ impl Ui {
 
         let unicode = !plain && utf8_console && locale_is_utf8();
 
+        // Colour for the picture only: the text already uses the 16-colour
+        // palette, which every terminal has. A picture does not survive 16
+        // colours, and 24-bit is not something to guess at - so it is asked for
+        // by name (`COLORTERM`), with the 256-colour cube as the fallback.
+        let colourterm = std::env::var("COLORTERM")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+        let pixels = if !color {
+            PixelColour::Off
+        } else if colourterm.contains("truecolor") || colourterm.contains("24bit") {
+            PixelColour::True
+        } else if colourterm.contains("256") || term.contains("256") {
+            PixelColour::Palette
+        } else if cfg!(windows) {
+            // The Windows console has understood 24-bit SGR since long before it
+            // understood to set `COLORTERM`; it is the one case worth assuming.
+            PixelColour::True
+        } else {
+            PixelColour::Off
+        };
+
         // A panic on the dashboard would otherwise print its message into the
         // alternate screen - which the shell throws away on exit - with the
         // cursor still hidden. Give the terminal back first, then let the default
@@ -599,6 +687,7 @@ impl Ui {
             color,
             glyphs: if unicode { UNICODE } else { ASCII },
             interactive: stdout_is_terminal && !plain && virtual_terminal,
+            pixels,
             width: AtomicUsize::new(0),
             height: AtomicUsize::new(0),
             live: Mutex::new(LiveState {
@@ -617,6 +706,9 @@ impl Ui {
             color,
             glyphs: if unicode { UNICODE } else { ASCII },
             interactive,
+            // Tests and `--ui-preview` get the full 24-bit path: it is the one
+            // with escapes in it, so it is the one worth exercising.
+            pixels: if color { PixelColour::True } else { PixelColour::Off },
             width: AtomicUsize::new(0),
             height: AtomicUsize::new(0),
             live: Mutex::new(LiveState {
@@ -1112,15 +1204,10 @@ impl Ui {
         // panel that is mostly picture is a worse dashboard than one that is
         // mostly numbers, which is what decides the two.
         let mut stats: Vec<&Row> = Vec::new();
-        let mut picture: Option<(&str, &[f32], usize, usize)> = None;
+        let mut picture: Option<(&str, &Picture)> = None;
         for row in &frame.rows {
             match row {
-                Row::View {
-                    label,
-                    plane,
-                    height,
-                    width,
-                } => picture = Some((label, plane, *height, *width)),
+                Row::View { label, picture: drawn } => picture = Some((label, drawn)),
                 other => stats.push(other),
             }
         }
@@ -1145,12 +1232,10 @@ impl Ui {
         // Beside: the box is at most a quarter of the panel's width, and only
         // when the numbers still get a sane column of their own.
         let mut beside: Option<Vec<String>> = None;
-        if let Some((label, plane, source_height, source_width)) = picture {
+        if let Some((label, drawn)) = picture {
             let lines = self.view_box(
                 label,
-                plane,
-                source_height,
-                source_width,
+                drawn,
                 inner,
                 height.saturating_sub(4),
                 inner.saturating_sub(allotted + 3),
@@ -1194,13 +1279,11 @@ impl Ui {
         // Under: only when it could not go beside, and only as tall as the rest
         // of the panel leaves room for.
         if beside.is_none()
-            && let Some((label, plane, source_height, source_width)) = picture
+            && let Some((label, drawn)) = picture
         {
             out.push_str(&self.view_block(
                 label,
-                plane,
-                source_height,
-                source_width,
+                drawn,
                 label_width,
                 inner,
                 height.saturating_sub(stats.len() + 4),
@@ -1367,47 +1450,98 @@ impl Ui {
         }
     }
 
-    /// One grey frame at `rows` x `columns`, one character per pixel.
+    /// One picture at `rows` x `columns`, one character cell per pixel.
     ///
-    /// `None` rather than a panic for a frame that is not the shape it claims
-    /// to be: a run does not stop learning because the picture is malformed.
+    /// The glyph says how bright the pixel is and the colour says what colour it
+    /// is: the ramp alone reads well on a terminal with no colour at all, and the
+    /// colour is what makes a corridor, a torch and a health bar distinguishable
+    /// at 32 columns wide. `None` rather than a panic for a picture that is not
+    /// the shape it claims to be: a run does not stop learning because the
+    /// picture is malformed.
     fn pixel_rows(
         &self,
-        plane: &[f32],
-        source_height: usize,
-        source_width: usize,
+        picture: &Picture,
         rows: usize,
         columns: usize,
     ) -> Option<Vec<String>> {
-        if source_width == 0
-            || source_height == 0
-            || rows == 0
-            || columns == 0
-            || plane.len() < source_width * source_height
-        {
+        if picture.is_empty() || rows == 0 || columns == 0 {
             return None;
         }
         // The same range detection the fingerprint does: a frame is normally in
         // `[0, 1]`, and a frame in 0..255 must not draw as a white block.
-        let peak = plane
+        let peak = picture
+            .rgb
             .iter()
             .copied()
             .filter(|value| value.is_finite())
             .fold(0.0f32, f32::max);
         let scale = if peak > 1.5 { 1.0 / 255.0 } else { 1.0 };
-        let sample = crate::vision::area_resize(plane, source_height, source_width, rows, columns);
+        let sample = picture.resized(rows, columns);
         let ramp = self.glyphs.shade;
         let mut lines = Vec::with_capacity(rows);
         for row in 0..rows {
-            let mut line = String::with_capacity(columns);
+            let mut line = String::with_capacity(columns * 4);
+            let mut current = String::new();
             for column in 0..columns {
-                let value = (sample[row * columns + column] * scale).clamp(0.0, 1.0);
-                let index = (value * (ramp.len() - 1) as f32).round() as usize;
-                line.push_str(ramp[index.min(ramp.len() - 1)]);
+                let [red, green, blue] = sample.pixel(row, column);
+                let (red, green, blue) = (
+                    (red * scale).clamp(0.0, 1.0),
+                    (green * scale).clamp(0.0, 1.0),
+                    (blue * scale).clamp(0.0, 1.0),
+                );
+                // With colour on, the glyph is how lit the pixel is and the
+                // escape says what colour it is - so a saturated red is a solid
+                // block of red, not a faint one. With colour off the glyph is the
+                // only thing there is, and then it has to be luminance, which is
+                // also what the model saw.
+                let luma = 0.299 * red + 0.587 * green + 0.114 * blue;
+                let brightness = if self.pixels == PixelColour::Off {
+                    luma
+                } else {
+                    red.max(green).max(blue)
+                };
+                let index = (brightness * (ramp.len() - 1) as f32).round() as usize;
+                let glyph = ramp[index.min(ramp.len() - 1)];
+                if !glyph.is_empty() {
+                    // One escape per colour change rather than per cell: a flat
+                    // sky or a wall is most of the picture, and this is the
+                    // difference between a repaint and a flood.
+                    let colour = self.pixel_colour(red, green, blue);
+                    if colour != current {
+                        line.push_str(&colour);
+                        current = colour;
+                    }
+                    line.push_str(glyph);
+                }
+            }
+            if !current.is_empty() {
+                line.push_str("\x1b[39m");
             }
             lines.push(line);
         }
         Some(lines)
+    }
+
+    /// The escape that makes the next glyph this colour, if colour is on.
+    ///
+    /// `38;2;r;g;b` is 24-bit and is what a modern terminal wants; the xterm
+    /// 256-colour cube is the fallback for a terminal that says `256color` but not
+    /// `truecolor`; a terminal that says neither gets no escape at all and draws
+    /// the shade ramp, which is a picture rather than a blank.
+    fn pixel_colour(&self, red: f32, green: f32, blue: f32) -> String {
+        let to_byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        match self.pixels {
+            PixelColour::Off => String::new(),
+            PixelColour::True => format!(
+                "\x1b[38;2;{};{};{}m",
+                to_byte(red),
+                to_byte(green),
+                to_byte(blue)
+            ),
+            PixelColour::Palette => {
+                format!("\x1b[38;5;{}m", ansi256(to_byte(red), to_byte(green), to_byte(blue)))
+            }
+        }
     }
 
     /// The widest the picture beside the numbers is drawn, in pixels.
@@ -1423,9 +1557,7 @@ impl Ui {
     fn view_box(
         &self,
         label: &str,
-        plane: &[f32],
-        source_height: usize,
-        source_width: usize,
+        picture: &Picture,
         inner: usize,
         room: usize,
         widest: usize,
@@ -1444,7 +1576,7 @@ impl Ui {
         if rows < 5 || columns < 16 {
             return None;
         }
-        let pixels = self.pixel_rows(plane, source_height, source_width, rows, columns)?;
+        let pixels = self.pixel_rows(picture, rows, columns)?;
         let mut lines: Vec<String> = Vec::with_capacity(rows + 2);
         lines.push(
             self.border(
@@ -1490,9 +1622,7 @@ impl Ui {
     fn view_block(
         &self,
         label: &str,
-        plane: &[f32],
-        source_height: usize,
-        source_width: usize,
+        picture: &Picture,
         label_width: usize,
         inner: usize,
         room: usize,
@@ -1512,7 +1642,7 @@ impl Ui {
         if columns < 12 || rows < 4 {
             return String::new();
         }
-        let Some(pixels) = self.pixel_rows(plane, source_height, source_width, rows, columns) else {
+        let Some(pixels) = self.pixel_rows(picture, rows, columns) else {
             return String::new();
         };
         // Centred in the space the numbers do not use: a block pinned to the
@@ -1740,12 +1870,13 @@ fn terminal_size() -> Option<(usize, usize)> {
 
 /// A plausible thing to look at, for `--ui-preview`.
 ///
-/// A horizon, a row of blocks drifting past, a character, and the falloff of a
-/// light: enough structure that the pixel view reads as a game rather than as
-/// noise, and it moves, so the preview shows a picture that changes the way a
+/// A sky, a ground, a row of blocks drifting past, a character and the falloff of
+/// a torch: enough structure that the pixel view reads as a game rather than as
+/// noise, in colours that are far enough apart to tell the parts apart at 32
+/// columns wide. It moves, so the preview shows a picture that changes the way a
 /// real run's does.
-fn preview_scene(tick: usize, size: usize) -> Vec<f32> {
-    let mut plane = vec![0.0f32; size * size];
+fn preview_picture(tick: usize, size: usize) -> Picture {
+    let mut rgb = vec![0.0f32; size * size * 3];
     let body = (size / 12).max(2) as i32;
     let walker = size as i32 / 2 + ((tick as f32 * 0.35).sin() * size as f32 * 0.2) as i32;
     let horizon = size * 44 / 100;
@@ -1753,30 +1884,55 @@ fn preview_scene(tick: usize, size: usize) -> Vec<f32> {
         for x in 0..size {
             let fx = x as f32 / size as f32;
             let fy = y as f32 / size as f32;
-            let mut value = if y < horizon {
-                0.18 + fy * 1.2
+            // Sky above the horizon, warm ground below it.
+            let mut colour = if y < horizon {
+                let depth = y as f32 / horizon.max(1) as f32;
+                [
+                    0.08 + 0.30 * depth,
+                    0.12 + 0.42 * depth,
+                    0.34 + 0.44 * depth,
+                ]
             } else {
-                0.30 - (fy - 0.44) * 0.35
+                let near = (y - horizon) as f32 / (size - horizon).max(1) as f32;
+                [
+                    0.42 - 0.16 * near,
+                    0.34 - 0.14 * near,
+                    0.22 - 0.10 * near,
+                ]
             };
-            // Blocks on the ground line, scrolling left.
+            // A green verge where the ground meets the sky.
+            if y >= horizon && y < horizon + (size / 16).max(1) {
+                colour = [0.30, 0.48, 0.20];
+            }
+            // Stone blocks on the ground line, scrolling left.
             if y >= horizon && y < horizon + size / 12 && (x / 7 + tick / 6) % 5 == 0 {
-                value += 0.22;
+                colour = [0.62, 0.60, 0.56];
             }
             // A floor seam every so often, so the ground has depth.
             if y >= horizon && (y - horizon) % (size / 8).max(2) == 0 {
-                value -= 0.10;
+                colour = [colour[0] * 0.55, colour[1] * 0.55, colour[2] * 0.55];
             }
-            // The character.
+            // The character: a bright coat over dark legs.
             let dx = x as i32 - walker;
             let dy = y as i32 - (horizon as i32 - body);
             if dx.abs() < body && (0..body * 2).contains(&dy) {
-                value = 0.92;
+                colour = if dy < body / 2 {
+                    [0.92, 0.74, 0.52]
+                } else {
+                    [0.86, 0.28, 0.18]
+                };
             }
+            // A torch: warm light that falls off with distance.
             let glow = ((fx - 0.5).powi(2) + (fy - 0.55).powi(2)).sqrt();
-            plane[y * size + x] = (value * (1.15 - glow).clamp(0.30, 1.0)).clamp(0.0, 1.0);
+            let falloff = (1.22 - glow).clamp(0.34, 1.0);
+            let warm = (0.16 * (1.0 - glow).clamp(0.0, 1.0), 0.0);
+            let index = (y * size + x) * 3;
+            rgb[index] = (colour[0] * falloff + warm.0).clamp(0.0, 1.0);
+            rgb[index + 1] = (colour[1] * falloff + warm.0 * 0.7).clamp(0.0, 1.0);
+            rgb[index + 2] = (colour[2] * falloff).clamp(0.0, 1.0);
         }
     }
-    plane
+    Picture::new(size, size, rgb)
 }
 
 /// Frames of a plausible run, for `--ui-preview`.
@@ -1834,7 +1990,7 @@ pub fn preview_frames() -> Vec<Frame> {
                     "W 42%   S 11%   A 9%   D 8%      W/A/S/D held 78% of steps",
                     Tone::Body,
                 )
-                .view("vision", preview_scene(tick, 64), 64, 64)
+                .picture("vision", preview_picture(tick, 48))
                 .footer("F8 pause   F9 save   F10 quit   Ctrl+C stop"),
         );
     }
@@ -2110,19 +2266,70 @@ mod tests {
     #[test]
     fn a_malformed_frame_draws_no_picture_and_does_not_panic() {
         let ui = Ui::fixed(false, true, true);
-        assert!(ui.pixel_rows(&[0.5; 4], 8, 8, 4, 8).is_none());
-        assert!(ui.pixel_rows(&[], 0, 0, 4, 8).is_none());
+        // A short buffer, an empty picture, and a zero-sized request.
+        let short = Picture::new(8, 8, vec![0.5; 4]);
+        assert!(ui.pixel_rows(&short, 4, 8).is_none());
+        assert!(ui.pixel_rows(&Picture::default(), 4, 8).is_none());
+        assert!(ui.pixel_rows(&plane_picture(&[0.5; 4], 2, 2), 0, 8).is_none());
     }
 
     #[test]
     fn the_picture_maps_dark_to_shade_and_bright_to_solid() {
         let ui = Ui::fixed(false, true, false);
         // Two pixels: black and white, sampled to the same two columns.
-        let rows = ui.pixel_rows(&[0.0, 1.0, 0.0, 1.0], 2, 2, 1, 2).unwrap();
+        let rows = ui.pixel_rows(&plane_picture(&[0.0, 1.0, 0.0, 1.0], 2, 2), 1, 2).unwrap();
         assert_eq!(rows, vec![" █".to_string()]);
         // A frame in 0..255 is read the same way a frame in 0..1 is.
-        let wide = ui.pixel_rows(&[0.0, 255.0, 0.0, 255.0], 2, 2, 1, 2).unwrap();
+        let wide = ui
+            .pixel_rows(&plane_picture(&[0.0, 255.0, 0.0, 255.0], 2, 2), 1, 2)
+            .unwrap();
         assert_eq!(wide, vec![" █".to_string()]);
+    }
+
+    /// A grey plane as the picture the renderer takes.
+    fn plane_picture(plane: &[f32], height: usize, width: usize) -> Picture {
+        Picture::from_grey(plane, height, width)
+    }
+
+    #[test]
+    fn a_colour_picture_is_drawn_in_colour() {
+        // A red pixel and a blue pixel, one row.
+        let picture = Picture::new(2, 1, vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        let ui = Ui::fixed(true, true, false);
+        let rows = ui.pixel_rows(&picture, 1, 2).unwrap();
+        let line = &rows[0];
+        // 24-bit foreground for each pixel, and the reset at the end of the row.
+        assert!(line.starts_with("\x1b[38;2;255;0;0m"), "{line:?}");
+        assert!(line.contains("\x1b[38;2;0;0;255m"), "{line:?}");
+        assert!(line.ends_with("\x1b[39m"), "{line:?}");
+        // With no colour the glyph is the only thing there is, so it is luminance
+        // - which is what the model was handed, and a red pixel is dim in it.
+        let plain = Ui::fixed(false, true, false);
+        let rows = plain.pixel_rows(&picture, 1, 2).unwrap();
+        assert_eq!(rows[0], "░ ");
+    }
+
+    #[test]
+    fn a_256_colour_terminal_gets_the_palette_and_not_24_bit() {
+        let picture = Picture::new(1, 1, vec![1.0, 0.0, 0.0]);
+        let mut ui = Ui::fixed(true, true, false);
+        ui.pixels = PixelColour::Palette;
+        let rows = ui.pixel_rows(&picture, 1, 1).unwrap();
+        assert!(rows[0].starts_with("\x1b[38;5;"), "{:?}", rows[0]);
+        assert!(!rows[0].contains("38;2;"), "{:?}", rows[0]);
+        // Pure red is cube index 196 (16 + 36 * 5).
+        assert_eq!(ansi256(255, 0, 0), 196);
+        // Mid grey is on the 24-step ramp, not the cube's diagonal.
+        assert_eq!(ansi256(128, 128, 128), 244);
+    }
+
+    #[test]
+    fn a_picture_narrower_than_its_box_is_stretched_not_dropped() {
+        let picture = Picture::new(2, 2, vec![1.0; 12]);
+        let resized = picture.resized(6, 8);
+        assert_eq!((resized.height, resized.width), (6, 8));
+        assert_eq!(resized.rgb.len(), 6 * 8 * 3);
+        assert!(resized.rgb.iter().all(|value| (*value - 1.0).abs() < 1e-6));
     }
 
     #[test]

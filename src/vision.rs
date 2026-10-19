@@ -62,6 +62,147 @@ impl Observation {
     }
 }
 
+/// A small colour picture of one frame: RGB in `[0, 1]`, row-major.
+///
+/// Only ever drawn. The model gets grey and has to keep getting grey - the
+/// weights were trained on luminance - but a person reading a dashboard does not:
+/// a corridor, a health bar and a hazard are told apart by hue long before they
+/// are told apart by brightness, and the grey stack has already thrown that away.
+/// So this is a second, much smaller picture of the same frame, made for the eye.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Picture {
+    pub width: usize,
+    pub height: usize,
+    /// `width * height * 3` values in `[0, 1]`, RGB order.
+    pub rgb: Vec<f32>,
+}
+
+impl Picture {
+    pub fn new(width: usize, height: usize, rgb: Vec<f32>) -> Self {
+        Self { width, height, rgb }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0 || self.rgb.len() < self.width * self.height * 3
+    }
+
+    /// One pixel. Out-of-range reads come back black rather than panicking: a
+    /// malformed picture must not stop a run.
+    pub fn pixel(&self, row: usize, column: usize) -> [f32; 3] {
+        if row >= self.height || column >= self.width {
+            return [0.0, 0.0, 0.0];
+        }
+        let index = (row * self.width + column) * 3;
+        match self.rgb.get(index..index + 3) {
+            Some([r, g, b]) => [*r, *g, *b],
+            _ => [0.0, 0.0, 0.0],
+        }
+    }
+
+    /// Rec. 601 luminance, which is what the shade ramp and the model both use.
+    pub fn luma(&self, row: usize, column: usize) -> f32 {
+        let [red, green, blue] = self.pixel(row, column);
+        0.299 * red + 0.587 * green + 0.114 * blue
+    }
+
+    /// A grey plane drawn as a colour picture, so the renderer has one resize.
+    ///
+    /// A frame the environment cannot produce in colour still gets drawn: three
+    /// equal channels read as grey through the same code path.
+    pub fn from_grey(plane: &[f32], height: usize, width: usize) -> Self {
+        if height == 0 || width == 0 || plane.len() < height * width {
+            return Self::default();
+        }
+        let mut rgb = Vec::with_capacity(height * width * 3);
+        for value in plane.iter().take(height * width) {
+            rgb.push(*value);
+            rgb.push(*value);
+            rgb.push(*value);
+        }
+        Self::new(width, height, rgb)
+    }
+
+    /// One channel as a `(height, width)` plane, for the area resizer.
+    fn plane(&self, channel: usize) -> Vec<f32> {
+        self.rgb.iter().skip(channel).step_by(3).copied().collect()
+    }
+
+    /// Area-averaged to `rows x columns` - the size the panel has room to draw.
+    pub fn resized(&self, rows: usize, columns: usize) -> Self {
+        if rows == 0 || columns == 0 || self.is_empty() {
+            return Self::default();
+        }
+        if rows == self.height && columns == self.width {
+            return self.clone();
+        }
+        let mut planes: Vec<Vec<f32>> = (0..3)
+            .map(|channel| area_resize(&self.plane(channel), self.height, self.width, rows, columns))
+            .collect();
+        let mut rgb = Vec::with_capacity(rows * columns * 3);
+        for index in 0..rows * columns {
+            for plane in planes.iter_mut() {
+                rgb.push(plane[index]);
+            }
+        }
+        Self::new(columns, rows, rgb)
+    }
+
+    /// A captured BGRA frame, averaged down to `rows x columns`.
+    ///
+    /// Each cell averages a small kernel centred on it rather than every pixel it
+    /// covers: a 32x32 thumbnail of a 1920x1080 frame would otherwise read two
+    /// million pixels to produce a thousand, twenty times a second, and none of
+    /// that fidelity survives being drawn at 32 columns wide. `size / 4` capped at
+    /// eight keeps a thin feature - a health bar, a crosshair - from disappearing
+    /// between samples.
+    pub fn from_bgra(
+        bgra: &[u8],
+        width: usize,
+        height: usize,
+        columns: usize,
+        rows: usize,
+    ) -> Self {
+        if width == 0 || height == 0 || columns == 0 || rows == 0 || bgra.len() < width * height * 4
+        {
+            return Self::default();
+        }
+        let column_step = (width / columns).max(1);
+        let row_step = (height / rows).max(1);
+        let kernel_columns = (column_step / 4).clamp(1, 8);
+        let kernel_rows = (row_step / 4).clamp(1, 8);
+        let mut rgb = vec![0.0f32; rows * columns * 3];
+        for out_row in 0..rows {
+            let middle_row = out_row * row_step + row_step / 2;
+            let first_row = middle_row.saturating_sub(kernel_rows / 2).min(height - 1);
+            let last_row = (first_row + kernel_rows).min(height);
+            for out_column in 0..columns {
+                let middle_column = out_column * column_step + column_step / 2;
+                let first_column = middle_column
+                    .saturating_sub(kernel_columns / 2)
+                    .min(width - 1);
+                let last_column = (first_column + kernel_columns).min(width);
+                let mut sums = [0.0f32; 3];
+                let mut count = 0.0f32;
+                for row in first_row..last_row {
+                    for column in first_column..last_column {
+                        let pixel = (row * width + column) * 4;
+                        sums[0] += bgra[pixel + 2] as f32;
+                        sums[1] += bgra[pixel + 1] as f32;
+                        sums[2] += bgra[pixel] as f32;
+                        count += 1.0;
+                    }
+                }
+                let scale = if count > 0.0 { 1.0 / (count * 255.0) } else { 0.0 };
+                let cell = (out_row * columns + out_column) * 3;
+                for channel in 0..3 {
+                    rgb[cell + channel] = (sums[channel] * scale).clamp(0.0, 1.0);
+                }
+            }
+        }
+        Self::new(columns, rows, rgb)
+    }
+}
+
 /// Number of cells in the coarse fingerprint.
 pub const GRID: usize = 256;
 /// Levels each cell is quantised into.
@@ -218,6 +359,50 @@ mod tests {
         }
         let different = gray_signature(&other, 48, 48, 32);
         assert_ne!(signature_key(&first), signature_key(&different));
+    }
+
+    #[test]
+    fn a_bgra_frame_becomes_a_thumbnail_in_the_right_colours() {
+        // 4x2, left half pure blue and right half pure red, in BGRA order:
+        // dropping an alpha-free buffer into the wrong channels is exactly the bug
+        // that makes a picture look haunted instead of wrong.
+        let mut bgra = Vec::new();
+        for _ in 0..2 {
+            for column in 0..4 {
+                if column < 2 {
+                    bgra.extend([255, 0, 0, 255]);
+                } else {
+                    bgra.extend([0, 0, 255, 255]);
+                }
+            }
+        }
+        let picture = Picture::from_bgra(&bgra, 4, 2, 2, 1);
+        assert_eq!((picture.width, picture.height), (2, 1));
+        assert_eq!(picture.pixel(0, 0), [0.0, 0.0, 1.0]);
+        assert_eq!(picture.pixel(0, 1), [1.0, 0.0, 0.0]);
+        // A buffer that is not the shape it claims to be is empty, not a panic.
+        assert!(Picture::from_bgra(&bgra[..4], 4, 2, 2, 1).is_empty());
+        assert!(Picture::from_bgra(&bgra, 0, 2, 2, 1).is_empty());
+    }
+
+    #[test]
+    fn a_thumbnail_keeps_its_colours_when_it_is_resized() {
+        // Two pixels: red then blue, stretched to four columns.
+        let picture = Picture::new(2, 1, vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        let resized = picture.resized(1, 4);
+        assert_eq!(resized.width, 4);
+        // The left half stays red and the right half stays blue: a resize that
+        // averaged the channels together would grey the picture out.
+        assert!(resized.pixel(0, 0)[0] > 0.9 && resized.pixel(0, 0)[2] < 0.1);
+        assert!(resized.pixel(0, 3)[2] > 0.9 && resized.pixel(0, 3)[0] < 0.1);
+    }
+
+    #[test]
+    fn a_grey_plane_becomes_a_picture_with_three_equal_channels() {
+        let picture = Picture::from_grey(&[0.0, 0.5, 1.0, 0.25], 2, 2);
+        assert_eq!(picture.pixel(0, 1), [0.5, 0.5, 0.5]);
+        assert!((picture.luma(1, 0) - 1.0).abs() < 1e-6);
+        assert!(Picture::from_grey(&[0.0], 4, 4).is_empty());
     }
 
     #[test]

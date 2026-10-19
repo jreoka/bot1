@@ -335,4 +335,17 @@ impl Environment for RealGameEnv {
         // Python falls back to as well.
         None
     }
+
+    /// The newest grabbed frame, in colour, for the panel's picture box.
+    ///
+    /// Kept by the frame stack as a 32x32 thumbnail, so this is a small clone and
+    /// not a second resize of a 1920x1080 grab.
+    fn picture(&self) -> Option<crate::vision::Picture> {
+        let preview = self.stack.preview();
+        if preview.is_empty() {
+            None
+        } else {
+            Some(preview.clone())
+        }
+    }
 }
