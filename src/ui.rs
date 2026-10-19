@@ -1980,8 +1980,8 @@ pub fn preview_frames() -> Vec<Frame> {
                     Tone::Body,
                 )
                 .meter(
-                    "rollout",
-                    format!("{:.0}%  {}/1024", progress * 100.0, (progress * 1024.0) as u32),
+                    "window",
+                    format!("{:.0}%  {}/512", progress * 100.0, (progress * 512.0) as u32),
                     progress,
                     Tone::Accent,
                 )
@@ -2134,7 +2134,7 @@ mod tests {
             .badge("RUNNING", Tone::Good)
             .line("steps", "24812   41.2/s   12 episode(s)", Tone::Value)
             .spark("reward", "+0.0412/step", vec![0.01, 0.02, 0.03, 0.02], Tone::Good)
-            .meter("rollout", "58%  604/1024", 0.58, Tone::Accent)
+            .meter("window", "58%  297/512", 0.58, Tone::Accent)
             .footer("F8 pause   F9 save   F10 quit");
         let composed = ui.compose(&frame);
         let widths: Vec<usize> = composed.lines().map(visible_width).collect();
@@ -2166,7 +2166,7 @@ mod tests {
             .badge("RUNNING", Tone::Good)
             .line("steps", "1008   167.3/s   3% in game   7 episode(s)", Tone::Value)
             .spark("reward", "+2.1051/step", vec![1.0, 2.0, 3.0], Tone::Good)
-            .meter("rollout", "94%  240/256", 0.94, Tone::Accent)
+            .meter("window", "94%  481/512", 0.94, Tone::Accent)
             .line("actions", "no keys+turn 45%   1 key(s)+turn 32%", Tone::Body)
             .view("vision", plane, 64, 64)
             .footer("F8 pause   F9 save   F10 quit")
@@ -2215,7 +2215,7 @@ mod tests {
         let frame = Frame::new("game")
             .badge("RUNNING", Tone::Good)
             .line("steps", "24812   41.2/s   12 episode(s)", Tone::Value)
-            .meter("rollout", "58%  604/1024", 0.58, Tone::Accent)
+            .meter("window", "58%  297/512", 0.58, Tone::Accent)
             .footer("F8 pause   F10 quit");
         let panel = ui.compose(&frame).lines().count();
         let mut log = VecDeque::new();

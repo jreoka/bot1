@@ -53,8 +53,7 @@ fn main() -> anyhow::Result<()> {
             value_of("--seed", 0),
             value_of("--steps", 24_000),
             48,
-            1024,
-            60,
+            value_of("--corridor", 60) as i32,
         )?;
         std::process::exit(if result.ok { 0 } else { 1 });
     }
@@ -196,7 +195,8 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
         "--heads" => attention_heads: usize,
         "--ffn-hidden" => ffn_hidden: usize,
         "--seq-len" => seq_len: usize,
-        "--rollout" => rollout_steps: usize,
+        "--update-every" => update_every: usize,
+        "--window-steps" => window_steps: usize,
         "--minibatch" => minibatch_size: usize,
         "--epochs" => epochs_per_update: usize,
         "--lr" => adam_lr: f32,
@@ -417,8 +417,14 @@ fn train(arguments: &[String]) -> anyhow::Result<()> {
         (
             "learns",
             format!(
-                "rollout {} x {} epoch(s) in {}-step minibatches, lr {:.0e}, entropy {}",
-                cfg.rollout_steps, cfg.epochs_per_update, cfg.minibatch_size, cfg.adam_lr, cfg.entropy_coef
+                "an update every {} decisions over the last {}, {} epoch(s) in {}-step \
+                 minibatches, lr {:.0e}, entropy {}",
+                cfg.update_every,
+                cfg.window(),
+                cfg.epochs_per_update,
+                cfg.minibatch_size,
+                cfg.adam_lr,
+                cfg.entropy_coef
             ),
         ),
         ("acts", action_space.describe()),
@@ -850,7 +856,7 @@ fn demo(steps: u64) -> anyhow::Result<()> {
     let ui = ui();
     ui.banner(env!("CARGO_PKG_VERSION"), &ui.platform_line());
     // Small, so updates land in seconds: the point is the interface, and a
-    // panel that says "collecting the first rollout" for four minutes shows
+    // panel that says "learning" with nothing moving for four minutes shows
     // none of it.
     let cfg = bot1::Config {
         frame_size: 64,
@@ -859,9 +865,11 @@ fn demo(steps: u64) -> anyhow::Result<()> {
         transformer_layers: 2,
         attention_heads: 4,
         mem_tokens: 8,
-        rollout_steps: 256,
-        minibatch_size: 64,
-        epochs_per_update: 2,
+        // A quarter of the shipped cadence, so the panel's window meter and the
+        // update row move several times a second on a synthetic env.
+        update_every: 16,
+        window_steps: 128,
+        epochs_per_update: 1,
         target_fps: 0.0,
         // Nothing to inject, so nothing to wait for - and no reason to steal
         // F8/F9/F10 from whatever else is on this desktop. Ctrl+C still stops
@@ -944,7 +952,7 @@ fn ui_preview() -> anyhow::Result<()> {
     ui.section("Checks");
     ui.event(
         "Check",
-        "8 tap/click choices are enabled, so a large share of every rollout is spent on \
+        "8 tap/click choices are enabled, so a large share of every batch is spent on \
          clicking things. In a game with an inventory or an attack button this is mostly \
          wasted input.",
     );
@@ -975,7 +983,7 @@ fn ui_preview() -> anyhow::Result<()> {
         "Health",
         Tone::Warn,
         "The last update took 3.4s, so the model is competing with the game for the CPU; \
-         raise --update-budget or lower --rollout if the frame rate matters.",
+         raise --update-budget or lower --window-steps if the frame rate matters.",
     );
     std::thread::sleep(std::time::Duration::from_millis(400));
     if let Some(last) = frames.last() {
@@ -1351,7 +1359,8 @@ fn print_help() {
         "--seed N, --steps N, --window N, --fps N, --focus once|always|never, --no-hotkeys, \
          --no-clip-cursor, --start-now, --pick, --dry-run, --fresh, --checkpoint-dir DIR, \
          --keep N, --log FILE, --priority normal|high|below-normal, --calibrate --seconds N, \
-         --mouse-turn PX, --frame-size N, --rollout N and every other BOT_* tunable.",
+         --mouse-turn PX, --frame-size N, --update-every N, --window-steps N and every \
+         other BOT_* tunable.",
     );
     ui.line(
         "--no-color strips the colour and the panels (BOT_UI=plain does the same); when the \

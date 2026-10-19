@@ -27,7 +27,6 @@ fn the_corridor_self_test_still_learns() {
         0,
         24_000,
         48,
-        1024,
         60,
     )
     .expect("the self-test itself must run");

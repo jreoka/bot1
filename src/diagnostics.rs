@@ -297,7 +297,7 @@ pub fn show_actions(cfg: &Config, mut keymap: Keymap) -> i32 {
             "Check",
             Tone::Warn,
             format!(
-                "{} tap/click choices are enabled, so a large share of every rollout is \
+                "{} tap/click choices are enabled, so a large share of every batch is \
                  spent clicking. In a game with an inventory or an attack button this is \
                  mostly wasted input.",
                 space.taps.len()
@@ -514,7 +514,7 @@ pub fn action_space_advice(cfg: &Config, keymap: &Keymap, space: &ActionSpace) -
     }
     if space.taps.len() > 6 {
         advice.push(format!(
-            "{} tap/click choices are enabled, so a large share of every rollout is spent on \
+            "{} tap/click choices are enabled, so a large share of every batch is spent on \
              clicking things. In a game with an inventory or an attack button this is mostly \
              wasted input.",
             space.taps.len()

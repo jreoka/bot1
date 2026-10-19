@@ -12,9 +12,9 @@ acts through the keyboard and mouse.
 │ steps    1,619   198.3/s   2% in game   00:08   11 episode(s)   01:32 left   ╭─ vision ────────╮│
 │ reward   +2.3846/step   ▁█                                                   │░░             ░░││
 │ update   loss -0.034   pi -0.000   v 0.027   ent 4.75   kl +0.0168   2.02s   │░░             ░░││
-│ rollout  32%  83/256  █████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │░░             ░░││
+│ window   32%  82/256  █████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │░░             ░░││
 │ actions  no keys+turn 44%   1 key(s)+turn 31%   no keys 9%                   │░░░░░░░░░░░░░░░░░││
-│ learning 2 update(s) applied, 1 in flight, 3 rollout(s) dropped              │▒░░░░░░░░░░░░░░░▒││
+│ learning 2 update(s) applied, 1 in flight                                    │▒░░░░░░░░░░░░░░░▒││
 │                                                                              │░░         ▒   ░░││
 │                                                                              │░░             ░░││
 │                                                                              │░░             ░░││
@@ -73,9 +73,9 @@ a panel that repaints in place underneath it, instead of a wall of `[Tag] text` 
 │ steps    1,619   198.3/s   2% in game   00:08   11 episode(s)   01:32 left   ╭─ vision ────────╮│
 │ reward   +2.3846/step   ▁█                                                   │░░             ░░││
 │ update   loss -0.034   pi -0.000   v 0.027   ent 4.75   kl +0.0168   2.02s   │░░             ░░││
-│ rollout  32%  83/256  █████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │░░             ░░││
+│ window   32%  82/256  █████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │░░             ░░││
 │ actions  no keys+turn 44%   1 key(s)+turn 31%   no keys 9%                   │░░░░░░░░░░░░░░░░░││
-│ learning 2 update(s) applied, 1 in flight, 3 rollout(s) dropped              │▒░░░░░░░░░░░░░░░▒││
+│ learning 2 update(s) applied, 1 in flight                                    │▒░░░░░░░░░░░░░░░▒││
 │                                                                              │░░         ▒   ░░││
 │                                                                              │░░             ░░││
 │                                                                              │░░             ░░││
@@ -196,9 +196,34 @@ Diagnostics, when something looks wrong:
 | `--platform` | what this build can and cannot do on this OS |
 | `--hotkeys` | register F8/F9/F10 and report what arrives |
 
-Tuning, if you want to experiment: `--fps`, `--frame-size`, `--rollout`, `--lr`,
-`--entropy`, `--update-budget`, `--checkpoint-every`, `--max-held-keys`, `--embed-dim`,
-`--layers`, `--mouse-turn`. Every field also has a `BOT_<FIELD>` environment override.
+Tuning, if you want to experiment: `--fps`, `--frame-size`, `--update-every`,
+`--window-steps`, `--lr`, `--entropy`, `--update-budget`, `--checkpoint-every`,
+`--max-held-keys`, `--embed-dim`, `--layers`, `--mouse-turn`. Every field also has a `BOT_<FIELD>` environment
+override.
+
+## How it learns
+
+An update is handed to the learning thread every 64 decisions - a little over six seconds of
+play at 20 fps - and scores the last 512 transitions, overlapping the window before it:
+
+```bash
+bot1                                   # the shipped cadence: every 64 decisions, last 512
+bot1 --update-every 32 --window-steps 512    # tighter cadence, same batch
+bot1 --update-every 64 --window-steps 256    # cheaper updates, smaller batch
+```
+
+The windows overlap on purpose. Nothing is dropped for being late, the newest decisions are
+always in the next window, and the policy has only moved by one chunk since most of the window
+was collected - which is what keeps PPO's importance ratio near 1 and the clip meaningful.
+Updates run on their own thread and the weights are swapped in at the next chunk boundary as
+soon as one has finished, so the bot adapts every few seconds of play instead of every couple
+of minutes.
+
+The number that decides whether this is training or just over-training is the reuse factor
+`minibatches * epochs / update_every`, which `--dry-run` prints: the shipped cadence is 0.031
+gradient steps per collected decision. Past roughly 0.25 the same frames are being trained far
+harder than the data justifies, and PPO's clip is the only thing between that and a policy that
+oscillates - so the run says so at startup when a flag combination lands there.
 
 ## When it does not work
 
@@ -213,7 +238,8 @@ or running exclusive fullscreen. Use borderless windowed and turn off "pause whe
 `--calibrate`) and actually play for a bit - `--actions` shows what it learned.
 
 **It is slow.** The model is a small transformer on the CPU; `--benchmark` reports the split
-between capture and inference. Lower `--frame-size` or `--rollout` if the machine is weak.
+between capture and inference. Lower `--frame-size` or `--window-steps` if the machine is
+weak.
 
 **It was learning and then stopped getting better.** `--report` says whether the reward has
 flattened. Usually the action set cannot reach new situations: calibrate again with the keys
@@ -236,7 +262,8 @@ A few choices matter more than the rest:
 - **The critic and the curiosity head share the transformer.** The model predicts the next
   frame's representation as one of its own heads; its prediction error is the novelty signal.
 - **Updates run on their own thread**, so the bot keeps playing while it learns instead of
-  freezing for a second every rollout.
+  freezing for a second every update, and each update scores a sliding window of the last 512
+  decisions handed over every 64.
 - **Stopping is not losing.** Checkpoints carry the weights, the step and episode counters,
   the reward's running estimates, and the bot's own mouse speed.
 

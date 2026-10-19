@@ -99,7 +99,19 @@ pub struct Config {
     // =====================================================================
     // PPO
     // =====================================================================
-    pub rollout_steps: usize,
+    /// Decisions collected between updates. An update is handed to the worker
+    /// every `update_every` decisions, scoring the last `window_steps`
+    /// transitions. Kept small on purpose: at 20 fps x 2 frames per decision,
+    /// 64 decisions is a little over six seconds of play.
+    pub update_every: usize,
+    /// Transitions one update scores end to end.
+    ///
+    /// The window overlaps the previous one rather than restarting, so each
+    /// transition is scored more than once. That is what buys the frequency: the
+    /// policy has only moved by one chunk since most of the window was collected,
+    /// which is what keeps PPO's importance ratio near 1. Must be at least
+    /// `2 * seq_len`.
+    pub window_steps: usize,
     pub minibatch_size: usize,
     pub epochs_per_update: usize,
     pub gamma: f32,
@@ -258,9 +270,12 @@ impl Default for Config {
             attention_dropout: 0.0,
             seq_len: 16,
 
-            rollout_steps: 1024,
+            update_every: 64,
+            window_steps: 512,
             minibatch_size: 256,
-            epochs_per_update: 4,
+            // One epoch: the windows overlap, so four passes over 512 transitions
+            // every 64 decisions would score each of them eight times.
+            epochs_per_update: 1,
             gamma: 0.99,
             gae_lambda: 0.95,
             clip_eps: 0.2,
@@ -363,10 +378,37 @@ impl Config {
         grid * grid
     }
 
-    /// Minibatches per epoch, given the rollout and minibatch size.
+    /// Transitions one update scores end to end.
+    pub fn window(&self) -> usize {
+        self.window_steps
+    }
+
+    /// Minibatches per epoch, given the window and minibatch size.
     pub fn update_minibatches(&self) -> usize {
         let mb = self.minibatch_size.max(self.seq_len);
-        (self.rollout_steps / mb).max(1)
+        self.window().div_ceil(mb).max(1)
+    }
+
+    /// Collection buffer capacity.
+    ///
+    /// The ring holds the window the next update will score plus one chunk of
+    /// decisions, because trimming happens at a chunk boundary and the buffer
+    /// must never overflow before it is trimmed.
+    pub fn buffer_capacity(&self) -> usize {
+        self.window() + self.update_every
+    }
+
+    /// Gradient steps taken per collected decision: how many times, on average,
+    /// each transition is scored.
+    ///
+    /// 2 x 1 / 64 = 0.031 with the shipped numbers. This is the one number that
+    /// decides whether frequent updates mean more learning or just more passes
+    /// over the same few frames: above ~0.25 the policy is being trained far
+    /// harder than the data justifies, and PPO's clip is the only thing stopping
+    /// it from walking off.
+    pub fn optimisation_per_sample(&self) -> f32 {
+        (self.update_minibatches() * self.epochs_per_update) as f32
+            / self.update_every.max(1) as f32
     }
 
     /// Fail loudly here rather than three hours into a run.
@@ -381,10 +423,15 @@ impl Config {
         anyhow::ensure!(self.action_repeat >= 1, "action_repeat must be at least 1");
         anyhow::ensure!(self.seq_len >= 2, "seq_len must be at least 2");
         anyhow::ensure!(
-            self.rollout_steps >= self.seq_len,
-            "rollout_steps {} must be at least seq_len {}",
-            self.rollout_steps,
+            self.window() >= 2 * self.seq_len,
+            "window_steps {} must be at least 2 * seq_len {}: an update needs more than \
+             one sequence to average over",
+            self.window(),
             self.seq_len
+        );
+        anyhow::ensure!(
+            self.update_every >= 1,
+            "update_every must be at least 1"
         );
         anyhow::ensure!(self.max_held_keys >= 1, "max_held_keys must be at least 1");
         anyhow::ensure!(self.embed_dim >= 8, "embed_dim must be at least 8");
@@ -491,7 +538,8 @@ impl Config {
         env_num!(attention_heads, usize);
         env_num!(attention_dropout, f32);
         env_num!(seq_len, usize);
-        env_num!(rollout_steps, usize);
+        env_num!(update_every, usize);
+        env_num!(window_steps, usize);
         env_num!(minibatch_size, usize);
         env_num!(epochs_per_update, usize);
         env_num!(gamma, f32);
@@ -595,7 +643,7 @@ impl Config {
         format!(
             "obs {}x{}x{} grey (+diff), repeat {}, rope transformer {}d x {}L x {}H, \
              gelu ffn {}x embed ({}), window {} frames, {} patch token(s)/frame, turn speed \
-             x[{}] from a {}px base, rollout {} x {} epochs in {}-step minibatches",
+             x[{}] from a {}px base, {}",
             self.frame_stack,
             self.frame_size,
             self.frame_size,
@@ -609,9 +657,20 @@ impl Config {
             self.frame_tokens(),
             speeds,
             base,
-            self.rollout_steps,
+            self.schedule_text()
+        )
+    }
+
+    /// One phrase for the update schedule: how often, and over how much data.
+    pub fn schedule_text(&self) -> String {
+        format!(
+            "an update every {} decisions over the last {} ({} epochs in {}-step \
+             minibatches, each transition scored {:.3} time(s))",
+            self.update_every,
+            self.window(),
             self.epochs_per_update,
-            self.minibatch_size
+            self.minibatch_size,
+            self.optimisation_per_sample()
         )
     }
 }
@@ -625,8 +684,30 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.frame_tokens(), 36);
         assert_eq!(cfg.channels(), 5);
-        assert_eq!(cfg.update_minibatches(), 4);
+        assert_eq!(cfg.update_minibatches(), 2);
         cfg.validate().expect("shipped defaults must be valid");
+    }
+
+    #[test]
+    fn the_shipped_cadence_reuses_each_transition_twice_a_minute() {
+        let cfg = Config::default();
+        // Two 256-step minibatches over a 512-step window, one epoch, every 64
+        // decisions: the number the README quotes and the run loop warns about.
+        assert_eq!(cfg.window(), 512);
+        assert_eq!(cfg.update_every, 64);
+        assert!((cfg.optimisation_per_sample() - 0.03125).abs() < 1e-6);
+        // The one sentence a user reads before a run has to describe what the
+        // run actually does.
+        let text = cfg.schedule_text();
+        assert!(text.contains("every 64 decisions"), "{text}");
+        assert!(text.contains("last 512"), "{text}");
+        assert!(text.contains("0.031"), "{text}");
+        // A window one sequence wide has nothing to average over.
+        let thin = Config {
+            window_steps: 2 * cfg.seq_len - 1,
+            ..Config::default()
+        };
+        assert!(thin.validate().is_err());
     }
 
     #[test]

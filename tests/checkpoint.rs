@@ -62,7 +62,7 @@ fn build(cfg: &bot1::Config) -> GameSession<Backend> {
 
 #[test]
 fn a_session_round_trips_through_a_checkpoint() {
-    let cfg = synthetic_train_config(48, 64, 3);
+    let cfg = synthetic_train_config(48, 3);
     let mut session = build(&cfg);
     session.reset(Some(7), false);
     // Enough steps that the counters, the reward statistics and the observation
@@ -125,7 +125,7 @@ fn a_session_round_trips_through_a_checkpoint() {
 
 #[test]
 fn a_checkpoint_from_a_different_action_space_is_refused() {
-    let cfg = synthetic_train_config(48, 64, 3);
+    let cfg = synthetic_train_config(48, 3);
     let session = build(&cfg);
     let directory = std::env::temp_dir().join("bot1-checkpoint-mismatch");
     let _ = std::fs::remove_dir_all(&directory);
@@ -223,7 +223,7 @@ fn the_exported_weights_load_back_identical() {
 /// key" and "throw away every hour of training".
 #[test]
 fn a_wider_action_space_warm_starts_from_what_still_fits() {
-    let narrow_cfg = synthetic_train_config(48, 64, 3);
+    let narrow_cfg = synthetic_train_config(48, 3);
     let mut session = build(&narrow_cfg);
     session.reset(Some(7), false);
     for _ in 0..40 {

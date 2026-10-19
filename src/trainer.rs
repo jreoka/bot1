@@ -115,7 +115,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         rewards.iter().map(|reward| reward / scale).collect()
     }
 
-    /// One PPO update over the collected rollout.
+    /// One PPO update over the collected window.
     pub fn update(
         &mut self,
         policy: &mut ActorCritic<B>,

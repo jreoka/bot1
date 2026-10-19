@@ -583,15 +583,18 @@ pub fn random_baseline(
 }
 
 /// A config for the synthetic runs: the same algorithm, no wall-clock pacing.
-pub fn synthetic_train_config(frame_size: usize, rollout_steps: usize, seed: u64) -> Config {
+pub fn synthetic_train_config(frame_size: usize, seed: u64) -> Config {
     let base = Config::default();
     Config {
         frame_size,
         frame_stack: 4,
         action_repeat: 2,
-        rollout_steps,
+        // The shipped cadence, so the check measures the schedule a real run
+        // uses: an update every 64 decisions over the last 512.
+        update_every: 64,
+        window_steps: 512,
         minibatch_size: 256,
-        epochs_per_update: 4,
+        epochs_per_update: 1,
         // A shorter memory window than the shipped default: the synthetic games
         // are decided by the last handful of frames, and the self-test is worth
         // more when it finishes in minutes than when it is marginally better.
@@ -671,10 +674,9 @@ pub fn run_learning_check<B: AutodiffBackend>(
     seed: u64,
     steps: u64,
     frame_size: usize,
-    rollout_steps: usize,
     corridor_length: i32,
 ) -> anyhow::Result<SelfTestResult> {
-    let cfg = synthetic_train_config(frame_size, rollout_steps, seed);
+    let cfg = synthetic_train_config(frame_size, seed);
     cfg.validate()?;
     let mut results = SelfTestResult::default();
 
@@ -716,15 +718,22 @@ pub fn run_learning_check<B: AutodiffBackend>(
     session.reset(Some(seed), false);
     let mut solved_at = 0u64;
     let mut updates_done = 0u64;
+    let mut since_update = 0usize;
     while session.total_steps < steps {
         let action = session.decide();
         let (_reward, done, _info) = session.step(&action);
         if done {
             session.reset(None, true);
         }
-        if session.buffer.len() >= cfg.rollout_steps {
+        // The same cadence rule the run loop uses: one update per `update_every`
+        // decisions, over the trailing window.
+        since_update += 1;
+        let due =
+            since_update >= cfg.update_every && session.buffer.len() >= 2 * cfg.seq_len;
+        if due {
+            since_update = 0;
             session.bootstrapped_value();
-            session.learn();
+            session.learn_window();
             updates_done += 1;
             if verbose {
                 // The Python's self-test says nothing until the end. A panel
@@ -764,6 +773,13 @@ pub fn run_learning_check<B: AutodiffBackend>(
             }
             // Stop as soon as the bot is demonstrably playing the game, rather
             // than spending the whole budget proving it twice.
+            //
+            // The threshold alone is not enough: the corridor is short enough
+            // that an untrained policy already walks most of it, so a probe at
+            // the very first update clears 0.5 x length without having learned
+            // anything. Requiring half a cell over where it *started* is what
+            // keeps this an acceptance test for training rather than for
+            // initialisation.
             if updates_done % 4 == 0 {
                 let probe = evaluate(
                     &session.acting,
@@ -772,7 +788,9 @@ pub fn run_learning_check<B: AutodiffBackend>(
                     3,
                     300,
                 );
-                if probe.mean_distance > 0.5 * corridor_length as f64 {
+                if probe.mean_distance > 0.5 * corridor_length as f64
+                    && probe.mean_distance > before.mean_distance + 0.5
+                {
                     solved_at = session.total_steps;
                     break;
                 }

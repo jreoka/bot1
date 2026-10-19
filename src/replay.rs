@@ -21,6 +21,13 @@
 use rand::RngExt;
 use rand::seq::SliceRandom;
 
+/// Slide `len` values down to index 0, keeping the newest ones in order.
+fn slide<T: Copy>(values: &mut [T], from: usize, len: usize) {
+    if len > 0 {
+        values.copy_within(from..from + len, 0);
+    }
+}
+
 pub struct RolloutBuffer {
     pub capacity: usize,
     pub embed_dim: usize,
@@ -206,6 +213,97 @@ impl RolloutBuffer {
 
     pub fn windows(&self) -> &[f32] {
         &self.window[..self.size * self.mem_tokens * self.embed_dim]
+    }
+
+    /// Copy transitions `[from, to)` of `other` onto the end of this buffer.
+    ///
+    /// This is how a real-time update gets its window: the collector keeps
+    /// writing to its own ring, and the job carries a plain copy of the newest
+    /// `window` transitions. A copy rather than a shared handle because the
+    /// worker must see one frozen slice of history while the collector rolls
+    /// underneath it.
+    pub fn append_range(&mut self, other: &RolloutBuffer, from: usize, to: usize) {
+        assert_eq!(
+            (self.embed_dim, self.mem_tokens, self.n_keys),
+            (other.embed_dim, other.mem_tokens, other.n_keys),
+            "append_range between buffers of different shapes"
+        );
+        let to = to.min(other.size);
+        if from >= to {
+            return;
+        }
+        let count = to - from;
+        assert!(
+            self.size + count <= self.capacity,
+            "RolloutBuffer overflow: append_range past capacity"
+        );
+        let (embed, mem, keys) = (self.embed_dim, self.mem_tokens, self.n_keys);
+        let base = self.size;
+        self.context[base * embed..(base + count) * embed]
+            .copy_from_slice(&other.context[from * embed..to * embed]);
+        self.summary[base * embed..(base + count) * embed]
+            .copy_from_slice(&other.summary[from * embed..to * embed]);
+        self.window[base * mem * embed..(base + count) * mem * embed]
+            .copy_from_slice(&other.window[from * mem * embed..to * mem * embed]);
+        self.held[base * keys..(base + count) * keys]
+            .copy_from_slice(&other.held[from * keys..to * keys]);
+        self.turn[base..base + count].copy_from_slice(&other.turn[from..to]);
+        self.speed[base..base + count].copy_from_slice(&other.speed[from..to]);
+        self.tap[base..base + count].copy_from_slice(&other.tap[from..to]);
+        self.logp[base..base + count].copy_from_slice(&other.logp[from..to]);
+        self.value[base..base + count].copy_from_slice(&other.value[from..to]);
+        self.reward[base..base + count].copy_from_slice(&other.reward[from..to]);
+        self.done[base..base + count].copy_from_slice(&other.done[from..to]);
+        self.reset[base..base + count].copy_from_slice(&other.reset[from..to]);
+        if let Some(theirs) = other.action_vector.as_ref() {
+            let dim = other.action_vector_dim;
+            if self.action_vector.is_none() {
+                self.action_vector_dim = dim;
+                self.action_vector = Some(vec![0.0; self.capacity * dim]);
+            }
+            if let Some(storage) = self.action_vector.as_mut() {
+                storage[base * dim..(base + count) * dim]
+                    .copy_from_slice(&theirs[from * dim..to * dim]);
+            }
+        }
+        self.episodes += other.done[from..to].iter().filter(|d| **d > 0.5).count();
+        self.size += count;
+    }
+
+    /// Drop the oldest `n` transitions, sliding the newest down in place.
+    ///
+    /// The allocations are fixed, per the module note, so this is a memmove of
+    /// what is kept rather than a reallocation. Terminal transitions leave with
+    /// whatever they were attached to, so the episode count is corrected here
+    /// instead of drifting.
+    pub fn drop_front(&mut self, n: usize) {
+        let n = n.min(self.size);
+        if n == 0 {
+            return;
+        }
+        let keep = self.size - n;
+        // Counted before the slide: after it those flags belong to other
+        // transitions.
+        let dropped_episodes = self.done[..n].iter().filter(|d| **d > 0.5).count();
+        let (embed, mem, keys) = (self.embed_dim, self.mem_tokens, self.n_keys);
+        slide(&mut self.context, n * embed, keep * embed);
+        slide(&mut self.summary, n * embed, keep * embed);
+        slide(&mut self.window, n * mem * embed, keep * mem * embed);
+        slide(&mut self.held, n * keys, keep * keys);
+        slide(&mut self.turn, n, keep);
+        slide(&mut self.speed, n, keep);
+        slide(&mut self.tap, n, keep);
+        slide(&mut self.logp, n, keep);
+        slide(&mut self.value, n, keep);
+        slide(&mut self.reward, n, keep);
+        slide(&mut self.done, n, keep);
+        slide(&mut self.reset, n, keep);
+        if let Some(storage) = self.action_vector.as_mut() {
+            let dim = self.action_vector_dim;
+            slide(storage, n * dim, keep * dim);
+        }
+        self.episodes = self.episodes.saturating_sub(dropped_episodes);
+        self.size = keep;
     }
 
     /// The (T, B) index grid for one minibatch, flattened row-major.
@@ -414,6 +512,81 @@ mod tests {
         assert_eq!(batches.len(), 1);
         // (T=4, B=2) row-major: two sequences of four consecutive steps.
         assert_eq!(batches[0], vec![0, 4, 1, 5, 2, 6, 3, 7]);
+    }
+
+    /// One transition whose every field encodes its index, so a copy or a slide
+    /// can be checked field by field instead of by length alone.
+    fn push_indexed(buffer: &mut RolloutBuffer, index: f32, terminal: bool) {
+        let (embed, mem, keys) = (buffer.embed_dim, buffer.mem_tokens, buffer.n_keys);
+        let context = vec![index; embed];
+        let summary = vec![index + 0.5; embed];
+        let window = vec![index + 0.25; mem * embed];
+        let held = vec![index + 0.75; keys];
+        buffer.add(
+            &context,
+            &summary,
+            &window,
+            &held,
+            index as usize % 2,
+            1,
+            0,
+            index * 0.5,
+            index * 2.0,
+            index,
+            terminal,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    fn dropping_the_front_keeps_the_newest_transitions() {
+        let mut buffer = RolloutBuffer::new(6, 2, 1, 1);
+        for step in 0..6 {
+            // The oldest transition is also the only terminal one: dropping it
+            // must take its episode count with it.
+            push_indexed(&mut buffer, step as f32, step == 0);
+        }
+        assert_eq!(buffer.episodes(), 1);
+        buffer.drop_front(2);
+        assert_eq!(buffer.len(), 4);
+        assert_eq!(buffer.rewards(), &[2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(buffer.values(), &[4.0, 6.0, 8.0, 10.0]);
+        // The memory window travels with its transition, not its position: the
+        // first kept transition is index 2, and the last is index 5.
+        let stride = buffer.mem_tokens * buffer.embed_dim;
+        assert_eq!(buffer.windows()[0], 2.25);
+        assert_eq!(buffer.windows()[3 * stride], 5.25);
+        assert_eq!(buffer.episodes(), 0);
+        // Still usable afterwards, which is the property the ring depends on.
+        push_indexed(&mut buffer, 6.0, false);
+        assert_eq!(buffer.len(), 5);
+    }
+
+    #[test]
+    fn append_range_copies_a_window_and_leaves_the_source_alone() {
+        let mut source = RolloutBuffer::new(6, 2, 1, 1);
+        for step in 0..6 {
+            push_indexed(&mut source, step as f32, step == 5);
+        }
+        let mut window = RolloutBuffer::new(4, 2, 1, 1);
+        window.append_range(&source, 2, 6);
+        assert_eq!(window.len(), 4);
+        assert_eq!(window.rewards(), &[2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(window.values(), &[4.0, 6.0, 8.0, 10.0]);
+        assert_eq!(window.log_probs(), &[1.0, 1.5, 2.0, 2.5]);
+        assert_eq!(window.dones(), &[0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(window.episodes(), 1);
+        // The third copied transition is source index 4, so the copy kept the
+        // window/transition pairing rather than shifting the windows along.
+        let stride = window.mem_tokens * window.embed_dim;
+        assert_eq!(window.windows()[2 * stride], 4.25);
+        assert_eq!(source.len(), 6, "the collector keeps its own history");
+        // A tail past the end is clamped to what exists.
+        let mut tail = RolloutBuffer::new(6, 2, 1, 1);
+        tail.append_range(&source, 4, 99);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail.rewards(), &[4.0, 5.0]);
     }
 
     #[test]
