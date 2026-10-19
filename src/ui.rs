@@ -4,12 +4,13 @@
 //! place that decides what a line looks like. That is what stops the output from
 //! being a wall of `[Tag] text`: the tags become coloured labels, the long
 //! warnings wrap, the run summary becomes a panel, and the run itself becomes a
-//! live dashboard that redraws in place instead of scrolling.
+//! live dashboard on the whole terminal.
 //!
 //! Two modes, chosen by what stdout actually is:
 //!
-//! * **rich** - stdout is a terminal. Colour, box drawing, word wrap, and a live
-//!   panel that is erased and redrawn each time it changes.
+//! * **rich** - stdout is a terminal. Colour, box drawing, word wrap, and a
+//!   dashboard that owns the screen: the alternate screen buffer, the log tail
+//!   on top, the panel at the bottom, every row painted in place.
 //! * **plain** - stdout is a pipe, a file, `NO_COLOR=1`, `TERM=dumb`, or
 //!   `BOT_UI=plain`. Exactly the old `[Tag] message` lines, one per line, no
 //!   escapes: `bot1 | tee run.log`, CI and a scrollback search all keep working.
@@ -25,9 +26,10 @@
 //!   `COLUMNS`/`LINES` if neither is available, so a panel is the width of the
 //!   actual window instead of a guess.
 //! * Nothing here can panic on a non-tty, and no line is ever wider than the
-//!   window: a wrapped line breaks the "move up N lines and redraw" bookkeeping,
-//!   so the composer pads to `width - 1` and truncates.
+//!   window: a wrapped line corrupts the row below it, so the composer pads to
+//!   `width - 1` and truncates.
 
+use std::collections::VecDeque;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -111,6 +113,8 @@ struct Glyphs {
     bar_empty: &'static str,
     spark: [&'static str; 8],
     bullet: &'static str,
+    /// The mark a value gets when it had to be cut: `…`, or `...` in ASCII.
+    ellipsis: &'static str,
     /// Dark to bright, one glyph per pixel of the vision view.
     shade: [&'static str; 5],
 }
@@ -128,6 +132,7 @@ const UNICODE: Glyphs = Glyphs {
     bar_empty: "░",
     spark: ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"],
     bullet: "·",
+    ellipsis: "…",
     shade: [" ", "░", "▒", "▓", "█"],
 };
 
@@ -144,6 +149,7 @@ const ASCII: Glyphs = Glyphs {
     bar_empty: ".",
     spark: [".", ":", "-", "=", "+", "*", "#", "@"],
     bullet: "-",
+    ellipsis: "...",
     shade: [" ", ".", ":", "*", "#"],
 };
 
@@ -374,6 +380,18 @@ impl Row {
             Row::Blank => "",
         }
     }
+
+    /// The value this row draws, without its bar or its sparkline.
+    ///
+    /// The value is what the row is for, so the layout measures it to decide how
+    /// much room the picture beside the numbers may have. A bar or a sparkline
+    /// shrinks instead: they say less than the number they sit next to.
+    fn value(&self) -> &str {
+        match self {
+            Row::Line { value, .. } | Row::Meter { value, .. } | Row::Spark { value, .. } => value,
+            Row::View { .. } | Row::Blank => "",
+        }
+    }
 }
 
 /// The panel a run redraws in place: a border, a heading, a badge, rows,
@@ -478,12 +496,13 @@ impl Frame {
 // =====================================================================
 
 struct LiveState {
-    /// Lines currently on screen at the bottom of the terminal.
-    drawn: usize,
-    last_draw: Instant,
+    /// The alternate screen is ours and has to be given back.
+    fullscreen: bool,
+    /// What `event` would have printed, newest last: the log tail above the
+    /// panel. Kept as rendered lines, escapes and all.
+    log: VecDeque<String>,
     frame: Option<Frame>,
-    cursor_hidden: bool,
-    width_at_draw: usize,
+    last_draw: Instant,
 }
 
 /// The one renderer. Reached through [`ui`].
@@ -503,6 +522,18 @@ pub struct Ui {
 /// numbers readable (a counter flickering at 60 Hz is unreadable) and costs
 /// nothing next to a forward pass.
 const REDRAW: Duration = Duration::from_millis(100);
+
+/// Take the whole screen: the alternate buffer, cleared, with no cursor.
+///
+/// The dashboard is the terminal rather than a block that moves down it. That is
+/// what makes a repaint honest: nothing is ever printed into the scrollback
+/// while a run is live, so no frame can be left half-erased above the next one,
+/// nothing scrolls under the cursor, and the row a line lands on never depends on
+/// how many rows the previous frame happened to draw.
+const ENTER_DASHBOARD: &str = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l";
+
+/// Give the terminal back: the cursor first, then the screen the user was on.
+const LEAVE_DASHBOARD: &str = "\x1b[?25h\x1b[?1049l";
 
 /// No panel on a terminal this small: the border alone would leave no room.
 const MIN_PANEL_WIDTH: usize = 46;
@@ -550,13 +581,15 @@ impl Ui {
 
         let unicode = !plain && utf8_console && locale_is_utf8();
 
-        // A panic with the cursor hidden leaves a terminal with no cursor and a
-        // panel frozen mid-frame. The hook is cheap and runs before the panic
-        // message, so the message is readable too.
+        // A panic on the dashboard would otherwise print its message into the
+        // alternate screen - which the shell throws away on exit - with the
+        // cursor still hidden. Give the terminal back first, then let the default
+        // hook report: the message lands in the scrollback where it can be read.
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic| {
+            echo::on();
             let mut out = std::io::stdout().lock();
-            let _ = out.write_all(b"\x1b[?25h\x1b[0J");
+            let _ = out.write_all(LEAVE_DASHBOARD.as_bytes());
             let _ = out.flush();
             drop(out);
             previous_hook(panic);
@@ -569,11 +602,10 @@ impl Ui {
             width: AtomicUsize::new(0),
             height: AtomicUsize::new(0),
             live: Mutex::new(LiveState {
-                drawn: 0,
+                fullscreen: false,
+                log: VecDeque::new(),
                 last_draw: Instant::now() - REDRAW,
                 frame: None,
-                cursor_hidden: false,
-                width_at_draw: 0,
             }),
         }
     }
@@ -588,11 +620,10 @@ impl Ui {
             width: AtomicUsize::new(0),
             height: AtomicUsize::new(0),
             live: Mutex::new(LiveState {
-                drawn: 0,
+                fullscreen: false,
+                log: VecDeque::new(),
                 last_draw: Instant::now() - REDRAW,
                 frame: None,
-                cursor_hidden: false,
-                width_at_draw: 0,
             }),
         }
     }
@@ -647,9 +678,9 @@ impl Ui {
     /// The width every rendered line must fit inside.
     ///
     /// One column short of the terminal, always: a terminal wraps a line that
-    /// exactly fills the last column, and a wrapped line breaks the bookkeeping
-    /// that erases the panel before redrawing it - the panel would smear down
-    /// the screen instead of redrawing in place.
+    /// exactly fills the last column, and the wrapped half lands on the row
+    /// below - which on the dashboard is the row after it, so the bottom of a
+    /// panel would be drawn on top of itself.
     fn usable(&self) -> usize {
         self.width().saturating_sub(1).max(20)
     }
@@ -744,7 +775,7 @@ impl Ui {
         let head = format!("{} {}", self.paint(Tone::Accent, self.glyphs.accent), self.paint(Tone::Value, &label));
         let used = 2 + visible_width(&label);
         let fill = width.saturating_sub(used + 1);
-        self.write(&format!(
+        self.announce(&format!(
             "\n{head} {}\n",
             self.paint(Tone::Dim, &self.glyphs.horizontal.repeat(fill))
         ));
@@ -761,9 +792,10 @@ impl Ui {
             .max()
             .unwrap_or(4)
             .clamp(4, 16);
+        let mut out = String::new();
         for (label, value) in rows {
             if !self.rich() {
-                self.write(&format!("  {label}: {value}\n"));
+                out.push_str(&format!("  {label}: {value}\n"));
                 continue;
             }
             let width = self.usable();
@@ -772,13 +804,14 @@ impl Ui {
             let mut first = true;
             for line in wrap(value, width.saturating_sub(indent)) {
                 if first {
-                    self.write(&format!("{head}{}\n", self.paint(Tone::Body, &line)));
+                    out.push_str(&format!("{head}{}\n", self.paint(Tone::Body, &line)));
                     first = false;
                 } else {
-                    self.write(&format!("{}{}\n", " ".repeat(indent), self.paint(Tone::Body, &line)));
+                    out.push_str(&format!("{}{}\n", " ".repeat(indent), self.paint(Tone::Body, &line)));
                 }
             }
         }
+        self.announce(&out);
     }
 
     /// A framed paragraph, for "what to do next" moments.
@@ -894,99 +927,142 @@ impl Ui {
     ///
     /// Throttled: the caller may call this on every decision.
     pub fn live(&self, frame: &Frame) {
-        self.draw(frame, false, false);
+        self.draw(frame, false);
     }
 
     /// Draw now, throttle or not.
     pub fn live_now(&self, frame: &Frame) {
-        self.draw(frame, true, false);
+        self.draw(frame, true);
     }
 
     /// Redraw the current panel at once - after a pause, a resume, a save.
     pub fn refresh(&self) {
-        let mut live = self.live.lock().unwrap();
-        if let Some(frame) = live.frame.clone() {
+        let frame = {
+            let mut live = self.live.lock().unwrap();
+            let Some(frame) = live.frame.clone() else {
+                return;
+            };
             live.last_draw = Instant::now() - REDRAW;
-            drop(live);
-            self.draw(&frame, true, false);
-        }
+            frame
+        };
+        self.draw(&frame, true);
     }
 
-    /// Remove the panel and give the cursor back. Safe to call more than once.
+    /// Give the terminal back. Safe to call more than once.
+    ///
+    /// The dashboard lives on the alternate screen, so from the caller's point of
+    /// view this is a no-op on a scrollback: the lines printed before the run are
+    /// still there, and the next `event` (the run summary) prints under them.
     pub fn finish(&self) {
         let mut live = self.live.lock().unwrap();
-        let mut out = String::new();
-        if live.drawn > 0 {
-            out.push_str(&erase(live.drawn));
-            live.drawn = 0;
-        }
-        if live.cursor_hidden {
-            out.push_str("\x1b[?25h");
-            live.cursor_hidden = false;
-        }
         live.frame = None;
-        drop(live);
-        if !out.is_empty() {
-            self.write(&out);
+        if !live.fullscreen {
+            return;
         }
+        live.fullscreen = false;
+        live.log.clear();
+        echo::on();
+        self.write(LEAVE_DASHBOARD);
     }
 
-    fn draw(&self, frame: &Frame, force: bool, _final_frame: bool) {
+    fn draw(&self, frame: &Frame, force: bool) {
         if !self.interactive {
             return;
         }
         let mut live = self.live.lock().unwrap();
         if !force && live.last_draw.elapsed() < REDRAW {
-            // Keep the newest frame so the next log line redraws the right one.
+            // Keep the newest frame so the next log line repaints the right one.
             live.frame = Some(frame.clone());
             return;
         }
-        let width = self.usable();
         let mut out = String::new();
-        if live.drawn > 0 {
-            // After a resize the old lines may have reflowed into a different
-            // number of rows, and erasing by the old count would take log lines
-            // with it. Start a fresh panel instead and leave the old one where
-            // it is: a duplicated panel is recoverable, eaten log lines are not.
-            if live.width_at_draw == width {
-                out.push_str(&erase(live.drawn));
-            }
-            live.drawn = 0;
+        if !live.fullscreen {
+            echo::off();
+            out.push_str(ENTER_DASHBOARD);
+            live.fullscreen = true;
+            live.log.clear();
         }
-        if !live.cursor_hidden {
-            out.push_str("\x1b[?25l");
-            live.cursor_hidden = true;
-        }
-        let rendered = self.compose(frame);
-        let count = rendered.matches('\n').count();
-        out.push_str(&rendered);
-        live.drawn = count;
-        live.width_at_draw = width;
-        live.last_draw = Instant::now();
+        out.push_str(&self.screen(&live.log, Some(frame)));
         live.frame = Some(frame.clone());
-        drop(live);
+        live.last_draw = Instant::now();
+        // Written with the lock still held: two threads that both decide to
+        // repaint must not interleave halves of two different screens.
         self.write(&out);
     }
 
-    /// Print a block above the panel: erase the panel, print, redraw.
+    /// Print a block above the panel.
+    ///
+    /// On the dashboard it becomes the log tail and the screen is repainted; on a
+    /// terminal with no dashboard yet it is just printed.
     fn announce(&self, block: &str) {
         let mut live = self.live.lock().unwrap();
-        let mut out = String::new();
-        if live.drawn > 0 {
-            if live.width_at_draw == self.usable() {
-                out.push_str(&erase(live.drawn));
-            }
-            live.drawn = 0;
+        if !live.fullscreen {
+            self.write(block);
+            return;
         }
-        out.push_str(block);
-        if let Some(frame) = live.frame.clone() {
-            let rendered = self.compose(&frame);
-            out.push_str(&rendered);
-            live.drawn = rendered.matches('\n').count();
-            live.last_draw = Instant::now();
-        }
-        drop(live);
+        self.push_log(&mut live, block);
+        let frame = live.frame.clone();
+        let out = self.screen(&live.log, frame.as_ref());
+        live.last_draw = Instant::now();
         self.write(&out);
+    }
+
+    /// Keep what was printed as lines of the log tail, newest last.
+    fn push_log(&self, live: &mut LiveState, block: &str) {
+        let width = self.usable();
+        let mut lines: Vec<&str> = block.split('\n').collect();
+        // The block ends with a newline; that is a line terminator, not a row.
+        if lines.last() == Some(&"") {
+            lines.pop();
+        }
+        for line in lines {
+            // Padded to the width so a line can never wrap onto the row below it,
+            // which on a dashboard would land in the middle of the panel.
+            live.log.push_back(fit(line, width));
+        }
+        // Bounded: the visible window is the terminal's height, and the rest is
+        // only there for the case where the window gets taller mid-run.
+        let keep = self.height().saturating_mul(4).max(48);
+        while live.log.len() > keep {
+            live.log.pop_front();
+        }
+    }
+
+    /// The whole terminal as one write: the log tail on top, the panel below it.
+    ///
+    /// Every row is addressed absolutely (`ESC[row;1H`) and cleared to the end of
+    /// the line, so a repaint never depends on what the last frame drew, on where
+    /// the cursor was left, or on how the window has been resized since. The rows
+    /// below the panel are the panel's own last row, so nothing is left over.
+    fn screen(&self, log: &VecDeque<String>, frame: Option<&Frame>) -> String {
+        let width = self.usable();
+        let height = self.height();
+        let mut panel: Vec<String> = match frame {
+            Some(frame) => self
+                .compose(frame)
+                .lines()
+                .map(|line| fit(line, width))
+                .collect(),
+            None => Vec::new(),
+        };
+        // `compose` already sizes the panel to the terminal. This is the backstop
+        // that makes that a guarantee: a panel one row too tall would scroll the
+        // screen and take the top of the dashboard with it.
+        panel.truncate(height);
+        let log_rows = height.saturating_sub(panel.len());
+        let shown: Vec<&String> = log.iter().rev().take(log_rows).rev().collect();
+        let blanks = log_rows.saturating_sub(shown.len());
+        let mut out = String::with_capacity((width + 10) * height);
+        for row in 0..blanks {
+            out.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
+        }
+        for (index, line) in shown.iter().enumerate() {
+            out.push_str(&format!("\x1b[{};1H{}\x1b[K", blanks + index + 1, line));
+        }
+        for (index, line) in panel.iter().enumerate() {
+            out.push_str(&format!("\x1b[{};1H{}\x1b[K", log_rows + index + 1, line));
+        }
+        out
     }
 
     // ---- composition ----
@@ -1049,6 +1125,23 @@ impl Ui {
             }
         }
 
+        // The numbers decide how much of the panel the picture may have: a value
+        // cut in half ("00:15 l") reads as a rendering bug, so the box shrinks to
+        // what the longest one leaves. It never shrinks below 18 columns - a
+        // narrower box shows nothing worth looking at - and on a terminal where
+        // even that does not fit beside the numbers the picture goes under them.
+        let needed = stats
+            .iter()
+            .map(|row| head_width + 1 + visible_width(row.value()))
+            .max()
+            .unwrap_or(0);
+        // Rounded up to a step of eight: a run's values creep by a character at a
+        // time (a step counter, a countdown, an episode count), and a picture that
+        // resized on every one of those would flicker for no reason. 18 columns of
+        // picture plus its two borders and a gap is the least that is worth having.
+        let wanted = ((needed + 7) / 8) * 8;
+        let allotted = wanted.min(inner.saturating_sub(20));
+
         // Beside: the box is at most a quarter of the panel's width, and only
         // when the numbers still get a sane column of their own.
         let mut beside: Option<Vec<String>> = None;
@@ -1060,12 +1153,11 @@ impl Ui {
                 source_width,
                 inner,
                 height.saturating_sub(4),
+                inner.saturating_sub(allotted + 3),
             );
             if let Some(lines) = lines {
                 let box_width = visible_width(&lines[0]);
-                // The numbers are the point of the panel: the picture only goes
-                // beside them when they still get their own column.
-                if inner >= box_width + 70 {
+                if inner >= box_width + allotted {
                     beside = Some(lines);
                 }
             }
@@ -1226,7 +1318,17 @@ impl Ui {
             Row::View { .. } => String::new(),
             Row::Line { value, tone, .. } => {
                 let space = inner.saturating_sub(head_width + 1);
-                format!("{head}{}", fit(&self.paint(*tone, value), space))
+                // A value that had to be cut says so: a number that stops
+                // mid-word looks like a bug in the thing being measured.
+                let mut painted = self.paint(*tone, value);
+                if visible_width(&painted) > space && space > 1 {
+                    painted = format!(
+                        "{}{}",
+                        truncate(&painted, space - visible_width(self.glyphs.ellipsis)),
+                        self.paint(Tone::Dim, self.glyphs.ellipsis)
+                    );
+                }
+                format!("{head}{}", fit(&painted, space))
             }
             Row::Meter {
                 value,
@@ -1326,8 +1428,14 @@ impl Ui {
         source_width: usize,
         inner: usize,
         room: usize,
+        widest: usize,
     ) -> Option<Vec<String>> {
-        let mut columns = Self::VIEW_COLUMNS.min(inner / 4).max(16);
+        // A box too narrow to show anything is worse than no box: the numbers
+        // keep their columns and the picture waits for a wider terminal.
+        if widest < 16 {
+            return None;
+        }
+        let mut columns = Self::VIEW_COLUMNS.min(inner / 4).min(widest).max(16);
         let mut rows = (columns / 2).max(1);
         if rows + 2 > room {
             rows = room.saturating_sub(2);
@@ -1482,18 +1590,70 @@ impl Ui {
     }
 }
 
-/// Move up `lines`, back to column 0, and erase everything from there down.
-///
-/// The `\x1b[G` is not cosmetic: cursor-up keeps the column it started at, so
-/// after a panel whose last line ended at column 99 the next draw would begin
-/// at column 99 and smear to the right instead of redrawing in place.
-fn erase(lines: usize) -> String {
-    format!("\x1b[{lines}A\x1b[G\x1b[0J")
-}
-
 // =====================================================================
 // The terminal itself
 // =====================================================================
+
+/// The terminal's own echo, which has to be off while the dashboard is up.
+///
+/// The hotkeys are global - F8 is pressed with this terminal in front of the
+/// user - and with echo on the kernel writes the escape sequence for that key
+/// into the middle of the panel, one row below wherever the cursor was left. It
+/// reads as a rendering bug and it is indistinguishable from one on a screenshot.
+/// The original settings are put back by `finish`, and by the panic hook when a
+/// run dies.
+#[cfg(unix)]
+mod echo {
+    use std::sync::Mutex;
+
+    static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
+
+    fn attributes() -> Option<libc::termios> {
+        unsafe {
+            let mut term: libc::termios = std::mem::zeroed();
+            // 1 is stdout: the terminal this process is drawing on.
+            if libc::tcgetattr(1, &mut term) != 0 {
+                None
+            } else {
+                Some(term)
+            }
+        }
+    }
+
+    /// Echo off, keeping what it was.
+    pub fn off() {
+        let Some(original) = attributes() else {
+            return;
+        };
+        let mut quiet = original;
+        quiet.c_lflag &= !libc::ECHO;
+        // The dashboard redraws whatever is under it every 100 ms anyway, so an
+        // echo is never useful - only ever damage.
+        if unsafe { libc::tcsetattr(1, libc::TCSANOW, &quiet) } == 0
+            && let Ok(mut saved) = SAVED.lock()
+        {
+            *saved = Some(original);
+        }
+    }
+
+    /// Whatever `off` changed, back.
+    pub fn on() {
+        let Ok(mut saved) = SAVED.lock() else {
+            return;
+        };
+        if let Some(original) = saved.take() {
+            unsafe {
+                libc::tcsetattr(1, libc::TCSANOW, &original);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod echo {
+    pub fn off() {}
+    pub fn on() {}
+}
 
 fn locale_is_utf8() -> bool {
     for name in ["LC_ALL", "LC_CTYPE", "LANG"] {
@@ -1688,6 +1848,58 @@ pub fn preview_frames() -> Vec<Frame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    /// The rows a dashboard paint addressed, as (row, visible text).
+    ///
+    /// Parsed back out of the escape stream on purpose: what matters is where a
+    /// row lands on the screen, not what the builder intended to draw there.
+    fn painted_rows(paint: &str) -> Vec<(usize, String)> {
+        let mut rows = Vec::new();
+        let mut current: Option<(usize, usize)> = None;
+        let mut index = 0;
+        while let Some(found) = paint[index..].find("\x1b[") {
+            let at = index + found;
+            if let Some((row, payload)) = row_address(paint, at) {
+                if let Some((previous, start)) = current.take() {
+                    rows.push((previous, visible_text(&paint[start..at])));
+                }
+                current = Some((row, payload));
+            }
+            index = at + 2;
+        }
+        if let Some((row, start)) = current {
+            rows.push((row, visible_text(&paint[start..])));
+        }
+        rows
+    }
+
+    /// `ESC [ row ; 1 H` at `at`: the row it addresses, and where its text starts.
+    fn row_address(text: &str, at: usize) -> Option<(usize, usize)> {
+        let after = text.get(at..)?.strip_prefix("\x1b[")?;
+        let digits: String = after
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect();
+        if digits.is_empty() || !after[digits.len()..].starts_with(";1H") {
+            return None;
+        }
+        Some((digits.parse().ok()?, at + 2 + digits.len() + 3))
+    }
+
+    /// A payload as the terminal shows it: escapes removed, trailing air trimmed.
+    fn visible_text(payload: &str) -> String {
+        let mut out = String::new();
+        let mut characters = payload.chars();
+        while let Some(character) = characters.next() {
+            if character == '\x1b' {
+                skip_escape(&mut characters);
+            } else {
+                out.push(character);
+            }
+        }
+        out.trim_end().to_string()
+    }
 
     #[test]
     fn an_escape_sequence_has_no_width() {
@@ -1770,8 +1982,9 @@ mod tests {
             .footer("F8 pause   F9 save   F10 quit");
         let composed = ui.compose(&frame);
         let widths: Vec<usize> = composed.lines().map(visible_width).collect();
-        // One column short of the terminal, every line, or the terminal wraps
-        // the panel and the redraw smears down the screen.
+        // One column short of the terminal, every line: a wrapped panel line
+        // lands on the row below it, which on the dashboard is another row of
+        // the panel.
         assert!(
             widths.iter().all(|width| *width == 79),
             "widths {widths:?}\n{composed}"
@@ -1832,9 +2045,66 @@ mod tests {
         let composed = ui.compose(&frame_with_view(plane));
         let widths: Vec<usize> = composed.lines().map(visible_width).collect();
         assert!(widths.iter().all(|width| *width == 79), "{composed}");
-        // The panel never draws more lines than the terminal has: a taller
-        // panel scrolls, and scrolling breaks the erase-by-count redraw.
+        // The panel never draws more lines than the terminal has: a taller panel
+        // scrolls the dashboard, and scrolling takes the log tail with it.
         assert!(composed.lines().count() < 12, "{composed}");
+    }
+
+    #[test]
+    fn the_dashboard_paints_every_row_once_and_anchors_the_panel_to_the_bottom() {
+        unsafe { std::env::set_var("COLUMNS", "80") };
+        let ui = Ui::fixed(true, true, true);
+        ui.width.store(80, Ordering::Relaxed);
+        ui.height.store(24, Ordering::Relaxed);
+        let frame = Frame::new("game")
+            .badge("RUNNING", Tone::Good)
+            .line("steps", "24812   41.2/s   12 episode(s)", Tone::Value)
+            .meter("rollout", "58%  604/1024", 0.58, Tone::Accent)
+            .footer("F8 pause   F10 quit");
+        let panel = ui.compose(&frame).lines().count();
+        let mut log = VecDeque::new();
+        for index in 0..40 {
+            log.push_back(fit(&format!("  line {index}"), 79));
+        }
+        let paint = ui.screen(&log, Some(&frame));
+        let rows = painted_rows(&paint);
+        // Every row of the terminal is painted exactly once: nothing is left
+        // over from the previous frame, and nothing is painted twice.
+        let addressed: Vec<usize> = rows.iter().map(|(row, _)| *row).collect();
+        assert_eq!(addressed, (1..=24).collect::<Vec<usize>>(), "{addressed:?}");
+        // The panel's bottom border is the last row, and its top border is
+        // exactly `panel` rows above it: the log tail fills everything above.
+        assert!(rows[23].1.starts_with('\u{2570}'), "{:?}", rows[23].1);
+        assert!(
+            rows[24 - panel].1.starts_with('\u{256d}'),
+            "{:?}",
+            rows[24 - panel].1
+        );
+        // The newest log line sits directly above the panel, not the oldest.
+        assert!(rows[24 - panel - 1].1.contains("line 39"), "{rows:?}");
+        // And no row is wider than the terminal, or it would wrap into the next.
+        for (row, text) in &rows {
+            assert!(visible_width(text) < 80, "row {row} is {} wide", visible_width(text));
+        }
+    }
+
+    #[test]
+    fn a_value_that_does_not_fit_ends_in_an_ellipsis() {
+        unsafe { std::env::set_var("COLUMNS", "60") };
+        let ui = Ui::fixed(true, true, true);
+        ui.width.store(60, Ordering::Relaxed);
+        ui.height.store(20, Ordering::Relaxed);
+        let frame = Frame::new("game").line(
+            "steps",
+            "24812   41.2/s   12 episode(s)   00:31 left   and more of it",
+            Tone::Value,
+        );
+        let composed = ui.compose(&frame);
+        assert!(composed.contains('\u{2026}'), "{composed}");
+        // The mark is part of the line, never past it.
+        for line in composed.lines() {
+            assert_eq!(visible_width(line), 59, "{line}");
+        }
     }
 
     #[test]

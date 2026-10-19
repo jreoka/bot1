@@ -8,11 +8,18 @@ reading, no game-specific hooks, no score parsing. It only ever sees pixels and 
 acts through the keyboard and mouse.
 
 ```text
-        screen ──▶ frames ──▶ patch tokens ──▶ RoPE transformer ──▶ keys / look / click
-                                                    │
-                                        "what will the next frame look like?"
-                                                    │
-                                             reward ──▶ PPO update
+╭─ Synthetic corridor ────────────────────────────────────────────────────────────────── RUNNING ─╮
+│ steps    1,619   198.3/s   2% in game   00:08   11 episode(s)   01:32 left   ╭─ vision ────────╮│
+│ reward   +2.3846/step   ▁█                                                   │░░             ░░││
+│ update   loss -0.034   pi -0.000   v 0.027   ent 4.75   kl +0.0168   2.02s   │░░             ░░││
+│ rollout  32%  83/256  █████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │░░             ░░││
+│ actions  no keys+turn 44%   1 key(s)+turn 31%   no keys 9%                   │░░░░░░░░░░░░░░░░░││
+│ learning 2 update(s) applied, 1 in flight, 3 rollout(s) dropped              │▒░░░░░░░░░░░░░░░▒││
+│                                                                              │░░         ▒   ░░││
+│                                                                              │░░             ░░││
+│                                                                              │░░             ░░││
+│                                                                              ╰─────────────────╯│
+╰─ F8 pause   F9 save   F10 quit   Ctrl+C stop ───────────────────────────────────────────────────╯
 ```
 
 ## Install
@@ -56,46 +63,48 @@ After that, plain `bot1` is the only command you need.
 
 ## What it looks like
 
-One screen, redrawn in place while it learns, instead of a wall of `[Tag] text` scrolling past:
+The run owns the whole terminal - the alternate screen, cleared once - with the log tail on top and
+a panel that repaints in place underneath it, instead of a wall of `[Tag] text` scrolling past:
 
 `bot1 --demo` on the synthetic corridor, at 100 columns:
 
 ```text
 ╭─ Synthetic corridor ────────────────────────────────────────────────────────────────── RUNNING ─╮
-│ steps    1,113   185.0/s   2% in game   00:06   8 episode(s)   08:54  ╭─ vision ───────────────╮│
-│ reward   +2.4558/step   ▁                                             │░░                    ░░││
-│ update   loss +0.056   pi -0.000   v 0.205   ent 4.68   kl +0.0002    │░░                    ░░││
-│ rollout  35%  89/256  ████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │░░                    ░░││
-│ actions  no keys+turn 46%   1 key(s)+turn 31%   no keys 9%            │░░                    ░░││
-│ learning 1 update(s) applied, 1 in flight, 2 rollout(s) dropped       │░░                    ░░││
-│                                                                       │░░░░░░░░░░░░░░░░░░░░░░░░││
-│                                                                       │░░░░░░░░░░░░░░░░░░░░░░░░││
-│                                                                       │░░░            ░░    ░░░││
-│                                                                       │░░             ░▒     ░░││
-│                                                                       │░░                    ░░││
-│                                                                       │░░                    ░░││
-│                                                                       │░░                    ░░││
-│                                                                       ╰────────────────────────╯│
+│ steps    1,619   198.3/s   2% in game   00:08   11 episode(s)   01:32 left   ╭─ vision ────────╮│
+│ reward   +2.3846/step   ▁█                                                   │░░             ░░││
+│ update   loss -0.034   pi -0.000   v 0.027   ent 4.75   kl +0.0168   2.02s   │░░             ░░││
+│ rollout  32%  83/256  █████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │░░             ░░││
+│ actions  no keys+turn 44%   1 key(s)+turn 31%   no keys 9%                   │░░░░░░░░░░░░░░░░░││
+│ learning 2 update(s) applied, 1 in flight, 3 rollout(s) dropped              │▒░░░░░░░░░░░░░░░▒││
+│                                                                              │░░         ▒   ░░││
+│                                                                              │░░             ░░││
+│                                                                              │░░             ░░││
+│                                                                              ╰─────────────────╯│
 ╰─ F8 pause   F9 save   F10 quit   Ctrl+C stop ───────────────────────────────────────────────────╯
 ```
 
 - **It shows you what it sees.** The `vision` box is the newest frame of the observation -
   the same grey square the model is handed - area-averaged down to one character per pixel.
-  Beside the numbers when the terminal is wide enough, under them when it is not, and gone
-  when there is no room for both.
+  Beside the numbers, shrunk to whatever width they do not need - a value that had to be cut
+  ends in `...` rather than stopping mid-word - and under them only on a terminal too narrow
+  to put both side by side.
 - **The header and the numbers move**: steps, decisions per second, episodes, elapsed time,
   and - with `--steps` - how long is left. Nothing is guessed; every number is the one the
   loop is working from.
 - **The reward has a shape.** One glyph per update, newest on the right: the absolute value
   means little, the direction is the question.
-- **Log lines are kept, not overwritten.** A checkpoint, a health warning, a pause: the panel
-  steps down, the line is printed, the panel comes back.
+- **Log lines are kept, not overwritten.** A checkpoint, a health warning, a pause: it prints in
+  the log above the panel, newest nearest the panel, and the panel never moves.
 - **It adapts to the terminal.** Too narrow for a border, and it becomes one dense line; no
   colour support, and it is ASCII; piped into a file or `tee`, and it is plain `[Tag] lines`
   with no escapes at all, exactly as before, so scripts keep working.
 - **`--ui-preview`** draws the panel with invented numbers if you want to see it without a
   game, and **`--demo`** runs the real loop on the synthetic corridor if you want to watch it
   fill in.
+
+The dashboard takes the terminal's alternate screen and turns off its echo, so pressing F8 with
+the terminal in front of you does not type `[19~` into the middle of the panel; both are given
+back when the run ends, on a normal exit, on Ctrl+C, and on a panic.
 
 On Windows the console is switched to UTF-8 and to ANSI escape handling at startup - a
 Windows 10 console does not understand either until it is asked - and on any OS the size comes
